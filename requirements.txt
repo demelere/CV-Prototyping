@@ -1,0 +1,5 @@
+gradio
+roboflow
+opencv-python
+numpy
+Pillow
