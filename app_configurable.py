@@ -12,8 +12,12 @@ import json
 # ============================================================================
 
 # Detection Parameters
-CONFIDENCE_THRESHOLD = 70  # Only show detections with this confidence % or higher (lowered for testing)
+CONFIDENCE_THRESHOLD = 70  # Only show detections with this confidence % or higher
 OVERLAP_THRESHOLD = 10     # Overlap threshold for non-maximum suppression
+
+# Processing Parameters
+TARGET_FPS = 20            # Target FPS for processing (lower = faster processing, better motion tracking)
+SKIP_FRAMES = True         # Whether to skip frames to match target FPS
 
 # Visual Display Parameters
 BOUNDING_BOX_THICKNESS = 2         # Thickness of bounding box lines
@@ -133,34 +137,50 @@ class VideoProcessor:
                 return None, f"Error: Could not open video file: {video_path}"
             
             # Get video properties
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            original_fps = int(cap.get(cv2.CAP_PROP_FPS))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
-            print(f"Video properties: {width}x{height}, {fps} fps, {total_frames} frames")
+            print(f"Original video: {width}x{height}, {original_fps} fps, {total_frames} frames")
+            print(f"Target FPS: {TARGET_FPS}, Processing: {'Skipping frames' if SKIP_FRAMES else 'All frames'}")
             print(f"Using confidence threshold: {CONFIDENCE_THRESHOLD}%, overlap: {OVERLAP_THRESHOLD}%")
+            
+            # Calculate frame skip interval
+            if SKIP_FRAMES and original_fps > TARGET_FPS:
+                skip_interval = max(1, original_fps // TARGET_FPS)
+                processed_frames = total_frames // skip_interval
+                print(f"Will process {processed_frames} frames (every {skip_interval}th frame)")
+            else:
+                skip_interval = 1
+                processed_frames = total_frames
             
             # Create temporary output file
             temp_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
             temp_output.close()
             
-            # Setup video writer
+            # Setup video writer with target FPS
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(temp_output.name, fourcc, fps, (width, height))
+            out = cv2.VideoWriter(temp_output.name, fourcc, TARGET_FPS, (width, height))
             
             if not out.isOpened():
                 return None, "Error: Could not create output video writer"
             
             frame_count = 0
+            processed_count = 0
             
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                    
+                
+                # Skip frames to match target FPS
+                if SKIP_FRAMES and frame_count % skip_interval != 0:
+                    frame_count += 1
+                    continue
+                
                 # Update progress
-                progress(frame_count / total_frames, desc=f"Processing frame {frame_count + 1}/{total_frames}")
+                progress(processed_count / processed_frames, desc=f"Processing frame {processed_count + 1}/{processed_frames}")
                 
                 # Save frame temporarily for Roboflow
                 temp_frame_path = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
@@ -176,8 +196,8 @@ class VideoProcessor:
                     ).json()
                     
                     # Debug: Print prediction info
-                    if frame_count % 30 == 0:  # Print every 30 frames to avoid spam
-                        print(f"Frame {frame_count}: Got prediction with {len(prediction.get('predictions', []))} detections")
+                    if processed_count % 10 == 0:  # Print every 10 processed frames
+                        print(f"Processed frame {processed_count}: Got prediction with {len(prediction.get('predictions', []))} detections")
                         if prediction.get('predictions'):
                             for i, pred in enumerate(prediction['predictions'][:3]):  # Show first 3
                                 print(f"  Detection {i}: {pred.get('class', 'Unknown')} at ({pred.get('x', 0):.3f}, {pred.get('y', 0):.3f}) with confidence {pred.get('confidence', 0):.3f}")
@@ -190,20 +210,21 @@ class VideoProcessor:
                     os.unlink(temp_frame_path.name)
                     
                 except Exception as e:
-                    print(f"Error processing frame {frame_count}: {e}")
+                    print(f"Error processing frame {processed_count}: {e}")
                     # Clean up temporary frame file
                     if os.path.exists(temp_frame_path.name):
                         os.unlink(temp_frame_path.name)
                 
                 # Write processed frame
                 out.write(frame)
+                processed_count += 1
                 frame_count += 1
             
             # Clean up
             cap.release()
             out.release()
             
-            return temp_output.name, f"Successfully processed {frame_count} frames"
+            return temp_output.name, f"Successfully processed {processed_count} frames at {TARGET_FPS} FPS"
             
         except Exception as e:
             print(f"Error in process_video: {e}")
@@ -392,6 +413,7 @@ with gr.Blocks(title="RF-DETR Video Object Detection", theme=gr.themes.Soft()) a
             **Current Settings:**
             - Confidence Threshold: {CONFIDENCE_THRESHOLD}%
             - Overlap Threshold: {OVERLAP_THRESHOLD}%
+            - Target FPS: {TARGET_FPS} (faster processing, better motion tracking)
             - Label Format: {LABEL_FORMAT}
             
             **Class Colors:**
