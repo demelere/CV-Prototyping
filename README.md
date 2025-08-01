@@ -21,7 +21,8 @@ CV-Prototyping/
 - RF-DETR video processing, shows weld pool, arc, tungsten electrode, and filler rod
 
 ### Pose Estimation (`obj_pose/`)
-- Keypoint detection and object pose estimation
+- Keypoint detection and object pose estimation of the electrode and rod
+- Will be combined with depth to make it 3D pose > 
 
 ## Getting Started
 

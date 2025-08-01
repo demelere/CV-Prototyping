@@ -4,4 +4,7 @@ numpy
 Pillow
 torch
 torchvision
-roboflow 
+roboflow
+huggingface_hub
+requests
+transformers 

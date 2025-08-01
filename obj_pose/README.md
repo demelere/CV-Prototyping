@@ -1,96 +1,146 @@
-# Keypoint Detection Video Processor
+# 3D Keypoint Detection with Depth Estimation
 
-A Gradio web application for processing videos with keypoint detection models trained on Roboflow.
+This application combines 2D keypoint detection from Roboflow with depth estimation from Hugging Face to create 3D pose estimation for TIG welding electrode and filler rod tracking.
 
-## Features
+## Overview
 
-- **Video Processing**: Upload and process videos with keypoint detection
-- **Preview Functionality**: Test inference on the first frame before processing
-- **Configurable Parameters**: Adjust confidence thresholds, FPS, visual settings
-- **Frame Skipping**: Optimize processing speed by skipping frames
-- **Keypoint Visualization**: Draw keypoints with customizable colors and labels
-- **Connection Lines**: Draw connections between keypoints (configurable)
-- **Progress Tracking**: Real-time progress updates during processing
+The system works by:
+1. 2D Keypoint Detection: Using your trained Roboflow model to detect keypoints on welding tools
+2. Depth Estimation: Using Depth Anything v2 from Hugging Face to estimate depth from monocular images
+3. 3D Reconstruction: Combining 2D keypoints with depth information to approximate 3D coordinates
+4. Pose Analysis: Calculating travel and work angles relative to the workpiece
 
-## Installation
+## Quick Start
 
-1. Install the required dependencies:
+### Install Dependencies
+
 ```bash
+cd obj_pose
 pip install -r requirements.txt
 ```
 
-2. Make sure you have a trained keypoint detection model on Roboflow.
+### Run the Application
 
-## Usage
-
-1. **Run the application**:
 ```bash
-python app_keypoint_detection.py
+python app_3d_pose_estimation_pipeline.py
 ```
 
-2. **Open your browser** and navigate to `http://localhost:7861`
-
-3. **Configure your Roboflow settings**:
-   - Enter your Roboflow API key
-   - Provide your workspace name
-   - Enter your project name
-   - Specify the version number
-
-4. **Upload a video** and test the preview functionality
-
-5. **Process the video** to get the final result with keypoints
+The app will be available at `http://localhost:7863`
 
 ## Configuration
 
-You can customize the application by modifying the configuration parameters at the top of `app_keypoint_detection.py`:
+### Key Parameters
 
-### Detection Parameters
-- `CONFIDENCE_THRESHOLD`: Minimum confidence for keypoint detection (default: 70%)
+```python
+# Detection Parameters
+CONFIDENCE_THRESHOLD = 25  # Only show keypoints with this confidence % or higher
 
-### Processing Parameters
-- `TARGET_FPS`: Target frames per second for processing (default: 20)
-- `SKIP_FRAMES`: Whether to skip frames to match target FPS (default: True)
+# Processing Parameters
+TARGET_FPS = 15            # Target FPS for processing (lower = faster processing)
+SKIP_FRAMES = True         # Whether to skip frames to match target FPS
 
-### Visual Display Parameters
-- `KEYPOINT_RADIUS`: Radius of keypoint circles (default: 4px)
-- `KEYPOINT_THICKNESS`: Thickness of keypoint circles (default: 2px)
-- `CONNECTION_THICKNESS`: Thickness of connection lines (default: 2px)
-- `KEYPOINT_COLOR`: Color of keypoints in BGR format (default: Green)
-- `CONNECTION_COLOR`: Color of connections in BGR format (default: Blue)
+# 3D Visualization Parameters
+SHOW_DEPTH_MAP = True              # Show depth map visualization
+SHOW_3D_COORDINATES = True         # Show 3D coordinates in labels
+DEPTH_SCALE_FACTOR = 1000.0        # Scale factor for depth values
 
-### Label Display Options
-- `SHOW_CONFIDENCE`: Show confidence scores in labels
-- `SHOW_KEYPOINT_NAME`: Show keypoint names in labels
-- `CONFIDENCE_DECIMAL_PLACES`: Number of decimal places for confidence
-- `LABEL_FORMAT`: Format for labels ("keypoint_confidence", "keypoint_only", etc.)
+# Depth Model Options
+DEPTH_MODEL_NAME = "depth-anything/Depth-Anything-V2-Small-hf"  # Small: Fastest, Large: Most accurate
+```
 
 ### Keypoint Connections
-Define connections between keypoints by modifying `KEYPOINT_CONNECTIONS`:
+
+Define connections between keypoints for your welding model:
+
 ```python
 KEYPOINT_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3),  # Example connections
-    (3, 4), (4, 5), (5, 6),  # Adjust based on your model
+    # Example for welding electrode
+    (0, 1),  # Electrode tip to handle
+    (1, 2),  # Handle to connection point
+    # Add more connections based on your model
 ]
+```
+
+## Understanding the Output
+
+### 3D Keypoints
+- Green circles: 2D keypoints with confidence above threshold
+- Color-coded by depth: Blue (closer) to Red (farther)
+- Labels: Show 3D coordinates (x, y, depth) and confidence
+
+### Depth Visualization
+- Grayscale depth map: Brighter = closer, darker = farther
+- Colored depth map: Viridis colormap for better visualization
+
+### Video Outputs
+- Processed video: Original video with 3D keypoints overlaid
+- Depth video: Depth map visualization for each frame
+- Combined video: Keypoints overlaid on depth map for each frame
+
+## For TIG Welding Analysis
+
+### Keypoint Setup
+For TIG welding electrode tracking, you'll want keypoints like:
+- Electrode tip (primary tracking point)
+- Electrode handle (for orientation)
+- Filler rod tip (if using filler)
+- Workpiece surface (reference point)
+
+### Angle Calculations
+Once you have 3D coordinates, you can calculate:
+
+```python
+def calculate_travel_angle(electrode_tip_3d, electrode_handle_3d, workpiece_normal):
+    """Calculate travel angle relative to workpiece"""
+    electrode_vector = electrode_tip_3d - electrode_handle_3d
+    # Calculate angle between electrode vector and workpiece normal
+    return angle_between_vectors(electrode_vector, workpiece_normal)
+
+def calculate_work_angle(electrode_tip_3d, travel_direction, workpiece_normal):
+    """Calculate work angle (perpendicular to travel direction)"""
+    # Calculate angle in the plane perpendicular to travel direction
+    pass
 ```
 
 ## Workflow
 
-1. **Upload Video**: Drag and drop your video file
-2. **Configure Settings**: Enter your Roboflow project details
-3. **Preview**: Click "Preview First Frame" to test inference
-4. **Process**: Click "Process Video" to generate the final result
-5. **Download**: Download the processed video with keypoints
+1. Upload Video: Drag and drop your video file
+2. Configure Settings: Enter your Roboflow project details
+3. Preview: Click "Preview First Frame" to test inference
+4. Process: Click "Process Video" to generate the final result
+5. Download: Download the processed video with 3D keypoints
 
 ## Troubleshooting
 
-- **No keypoints detected**: Check your confidence threshold and model performance
-- **Incorrect coordinates**: The app handles both percentage (0-1) and pixel coordinates
-- **Slow processing**: Reduce `TARGET_FPS` or enable `SKIP_FRAMES`
-- **Memory issues**: Process shorter videos or reduce frame resolution
+### Common Issues
+
+1. Model Loading Errors
+   - Check your Roboflow API key and project details
+   - Ensure your model supports keypoint detection
+   - Verify the model version number
+
+2. Depth Estimation Issues
+   - Depth scale may need adjustment (DEPTH_SCALE_FACTOR)
+   - Try different depth models if needed
+   - Check image quality and lighting
+
+3. Performance Issues
+   - Reduce TARGET_FPS for faster processing
+   - Increase SKIP_FRAMES for lower computational load
+   - Consider using a smaller depth model
+
+### Debug Information
+
+The app provides detailed logging:
+- Frame processing status
+- Keypoint detection counts
+- Depth estimation results
+- 3D coordinate calculations
 
 ## Model Requirements
 
 Your Roboflow keypoint detection model should return predictions in this format:
+
 ```json
 {
   "predictions": [
@@ -108,6 +158,37 @@ Your Roboflow keypoint detection model should return predictions in this format:
 }
 ```
 
-## Port Configuration
+## Next Steps
 
-The app runs on port 7861 by default. You can change this in the `demo.launch()` call at the bottom of the file. 
+### Calibrate for Your Setup
+- Adjust DEPTH_SCALE_FACTOR based on your camera setup
+- Fine-tune confidence thresholds
+- Define appropriate keypoint connections
+
+### Add Workpiece Detection
+- Train a separate model for workpiece detection
+- Use workpiece surface normal for angle calculations
+- Implement workpiece pose estimation
+
+### Real-time Processing
+- Consider local model deployment for real-time use
+- Optimize frame processing pipeline
+- Add angle calculation in real-time
+
+### Advanced Analysis
+- Implement travel speed calculation
+- Add arc length measurement
+- Create welding quality metrics
+
+## Resources
+
+- [Roboflow Keypoint Detection](https://docs.roboflow.com/keypoint-detection)
+- [Depth Anything v2 Model](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf)
+- [OpenCV Documentation](https://docs.opencv.org/)
+
+## Support
+
+If you encounter issues:
+1. Check the console output for error messages
+2. Verify your API keys and model configurations
+3. Check the troubleshooting section above 

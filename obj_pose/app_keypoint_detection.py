@@ -12,15 +12,15 @@ import json
 # ============================================================================
 
 # Detection Parameters
-CONFIDENCE_THRESHOLD = 70  # Only show keypoints with this confidence % or higher
+CONFIDENCE_THRESHOLD = 25  # Only show keypoints with this confidence % or higher
 
 # Processing Parameters
 TARGET_FPS = 15            # Target FPS for processing (lower = faster processing, better motion tracking)
 SKIP_FRAMES = True         # Whether to skip frames to match target FPS
 
 # Visual Display Parameters
-KEYPOINT_RADIUS = 4        # Radius of keypoint circles
-KEYPOINT_THICKNESS = 2     # Thickness of keypoint circles
+KEYPOINT_RADIUS = 8        # Radius of keypoint circles (increased for visibility)
+KEYPOINT_THICKNESS = 3     # Thickness of keypoint circles (increased for visibility)
 CONNECTION_THICKNESS = 2   # Thickness of connection lines between keypoints
 KEYPOINT_COLOR = (0, 255, 0)  # Green keypoints (BGR)
 CONNECTION_COLOR = (255, 0, 0)  # Blue connections (BGR)
@@ -48,9 +48,28 @@ KEYPOINT_CONNECTIONS = [
 class KeypointProcessor:
     def __init__(self, api_key, workspace_name, project_name, version_number):
         """Initialize the keypoint processor with Roboflow model"""
-        self.rf = Roboflow(api_key=api_key)
-        self.project = self.rf.workspace(workspace_name).project(project_name)
-        self.model = self.project.version(version_number).model
+        try:
+            print("Initializing Roboflow...")
+            self.rf = Roboflow(api_key=api_key)
+            
+            print(f"Loading workspace: {workspace_name}")
+            workspace = self.rf.workspace(workspace_name)
+            
+            print(f"Loading project: {project_name}")
+            self.project = workspace.project(project_name)
+            
+            print(f"Loading model version: {version_number}")
+            self.model = self.project.version(version_number).model
+            
+            if self.model is None:
+                print("❌ Model is None after loading")
+            else:
+                print("✅ Model loaded successfully")
+                
+        except Exception as e:
+            print(f"❌ Error in KeypointProcessor.__init__: {e}")
+            self.model = None
+            raise e
         
     def format_label(self, keypoint_name, confidence):
         """Format the label based on configuration"""
@@ -73,19 +92,24 @@ class KeypointProcessor:
     def draw_keypoints(self, frame, predictions):
         """Draw keypoints and connections on the frame"""
         if not predictions:
+            print("No predictions to draw")
             return frame
             
         img_height, img_width = frame.shape[:2]
+        print(f"Drawing keypoints on frame size: {img_width}x{img_height}")
+        print(f"Processing {len(predictions)} predictions")
         
         # Process each prediction (could be multiple people/objects)
         for prediction in predictions:
             keypoints = prediction.get('keypoints', [])
             if not keypoints:
+                print("No keypoints in this prediction")
                 continue
                 
             # Debug: Print keypoint info for first few predictions
             if len([p for p in predictions if p == prediction]) <= 2:
                 print(f"Prediction with {len(keypoints)} keypoints")
+                print(f"Keypoints data: {keypoints[:2]}")  # Show first 2 keypoints
                 
             # Draw keypoints
             for i, keypoint in enumerate(keypoints):
@@ -96,19 +120,24 @@ class KeypointProcessor:
                 
                 # Skip low confidence keypoints (handle both percentage and decimal formats)
                 confidence_threshold = CONFIDENCE_THRESHOLD / 100.0 if CONFIDENCE_THRESHOLD > 1 else CONFIDENCE_THRESHOLD
+                print(f"Keypoint {i} confidence: {confidence:.3f}, threshold: {confidence_threshold:.3f}")
                 if confidence < confidence_threshold:
+                    print(f"  Skipping keypoint {i} due to low confidence")
                     continue
                 
                 # Convert coordinates
                 # Roboflow returns coordinates as percentages (0-1) or absolute pixels
+                print(f"  Original coordinates: x={x}, y={y}")
                 if x <= 1 and y <= 1:
                     # Coordinates are percentages (0-1)
                     pixel_x = int(x * img_width)
                     pixel_y = int(y * img_height)
+                    print(f"  Converting from percentages to pixels")
                 else:
                     # Coordinates are already in pixels
                     pixel_x = int(x)
                     pixel_y = int(y)
+                    print(f"  Using coordinates as pixels")
                 
                 # Ensure coordinates are within image bounds
                 pixel_x = max(0, min(img_width - 1, pixel_x))
@@ -117,8 +146,12 @@ class KeypointProcessor:
                 # Debug: Print converted coordinates
                 if len([p for p in predictions if p == prediction]) <= 2 and i < 3:
                     print(f"Keypoint {i}: {keypoint_name} at ({pixel_x}, {pixel_y}) with confidence {confidence:.3f}")
+                    print(f"  Original coords: ({x}, {y})")
+                    print(f"  Image size: {img_width}x{img_height}")
+                    print(f"  Bounds check: x={pixel_x} (0-{img_width-1}), y={pixel_y} (0-{img_height-1})")
                 
                 # Draw keypoint circle
+                print(f"Drawing keypoint at ({pixel_x}, {pixel_y}) with radius {KEYPOINT_RADIUS}")
                 cv2.circle(frame, (pixel_x, pixel_y), KEYPOINT_RADIUS, KEYPOINT_COLOR, KEYPOINT_THICKNESS)
                 
                 # Draw label if enabled
@@ -255,15 +288,25 @@ class KeypointProcessor:
                         # Fallback for models that don't support confidence parameter
                         prediction = self.model.predict(temp_frame_path.name).json()
                     
+                    # Handle nested prediction structure
+                    actual_predictions = []
+                    if 'predictions' in prediction:
+                        for pred in prediction['predictions']:
+                            if 'predictions' in pred:
+                                # Nested structure: prediction['predictions'][0]['predictions']
+                                actual_predictions.extend(pred['predictions'])
+                            else:
+                                # Direct structure: prediction['predictions']
+                                actual_predictions.append(pred)
+                    
                     # Debug: Print prediction info
                     if processed_count % 10 == 0:  # Print every 10 processed frames
-                        predictions_list = prediction.get('predictions', [])
-                        total_keypoints = sum(len(pred.get('keypoints', [])) for pred in predictions_list)
-                        print(f"Processed frame {processed_count}: Got {len(predictions_list)} predictions with {total_keypoints} total keypoints")
+                        total_keypoints = sum(len(pred.get('keypoints', [])) for pred in actual_predictions)
+                        print(f"Processed frame {processed_count}: Got {len(actual_predictions)} predictions with {total_keypoints} total keypoints")
                     
                     # Draw keypoints on frame
-                    if 'predictions' in prediction:
-                        frame = self.draw_keypoints(frame, prediction['predictions'])
+                    if actual_predictions:
+                        frame = self.draw_keypoints(frame, actual_predictions)
                     
                     # Clean up temporary frame file
                     os.unlink(temp_frame_path.name)
@@ -292,9 +335,21 @@ class KeypointProcessor:
 def create_processor(api_key, workspace_name, project_name, version_number):
     """Create and return a keypoint processor instance"""
     try:
+        print(f"Creating processor with:")
+        print(f"  Workspace: {workspace_name}")
+        print(f"  Project: {project_name}")
+        print(f"  Version: {version_number}")
+        
         processor = KeypointProcessor(api_key, workspace_name, project_name, int(version_number))
+        
+        # Check if model was loaded successfully
+        if processor.model is None:
+            return None, "Error: Model is None - check your project details"
+        
+        print("✅ Model loaded successfully!")
         return processor, "Model loaded successfully!"
     except Exception as e:
+        print(f"❌ Error creating processor: {e}")
         return None, f"Error loading model: {str(e)}"
 
 def process_video_with_model(api_key, workspace_name, project_name, version_number, video_file):
@@ -313,6 +368,10 @@ def process_video_with_model(api_key, workspace_name, project_name, version_numb
         processor, status = create_processor(api_key, workspace_name, project_name, version_number)
         if processor is None:
             return None, status
+        
+        # Additional check for None model
+        if processor.model is None:
+            return None, "Error: Model failed to load - check your Roboflow configuration"
         
         # Handle video file path (Gradio returns string path directly)
         video_path = video_file if isinstance(video_file, str) else video_file.name
@@ -348,6 +407,10 @@ def preview_first_frame(api_key, workspace_name, project_name, version_number, v
         if processor is None:
             return None, status
         
+        # Additional check for None model
+        if processor.model is None:
+            return None, "Error: Model failed to load - check your Roboflow configuration"
+        
         # Handle video file path
         video_path = video_file if isinstance(video_file, str) else video_file.name
         
@@ -382,20 +445,47 @@ def preview_first_frame(api_key, workspace_name, project_name, version_number, v
                 # Fallback for models that don't support confidence parameter
                 prediction = processor.model.predict(temp_frame_path.name).json()
             
-            # Draw keypoints on frame
+            # Debug: Print raw prediction structure
+            print(f"Raw prediction keys: {list(prediction.keys())}")
             if 'predictions' in prediction:
-                frame = processor.draw_keypoints(frame, prediction['predictions'])
-                total_keypoints = sum(len(pred.get('keypoints', [])) for pred in prediction['predictions'])
-                print(f"Preview: Found {len(prediction['predictions'])} predictions with {total_keypoints} total keypoints")
+                print(f"Number of predictions: {len(prediction['predictions'])}")
+                for i, pred in enumerate(prediction['predictions']):
+                    print(f"Prediction {i} keys: {list(pred.keys())}")
+                    if 'keypoints' in pred:
+                        print(f"  Keypoints: {len(pred['keypoints'])}")
+                    else:
+                        print(f"  No keypoints found in prediction {i}")
+            else:
+                print("No 'predictions' key found in response")
+            
+            # Handle nested prediction structure
+            actual_predictions = []
+            if 'predictions' in prediction:
+                for pred in prediction['predictions']:
+                    if 'predictions' in pred:
+                        # Nested structure: prediction['predictions'][0]['predictions']
+                        actual_predictions.extend(pred['predictions'])
+                    else:
+                        # Direct structure: prediction['predictions']
+                        actual_predictions.append(pred)
+            
+            print(f"Actual predictions to process: {len(actual_predictions)}")
+            
+            # Draw keypoints on frame
+            if actual_predictions:
+                print(f"About to draw {len(actual_predictions)} predictions")
+                frame = processor.draw_keypoints(frame, actual_predictions)
+                total_keypoints = sum(len(pred.get('keypoints', [])) for pred in actual_predictions)
+                print(f"Preview: Found {len(actual_predictions)} predictions with {total_keypoints} total keypoints")
                 
                 # Print details for first few keypoints
-                for i, pred in enumerate(prediction['predictions'][:2]):  # Show first 2 predictions
+                for i, pred in enumerate(actual_predictions[:2]):  # Show first 2 predictions
                     keypoints = pred.get('keypoints', [])
                     print(f"  Prediction {i}: {len(keypoints)} keypoints")
                     for j, kp in enumerate(keypoints[:3]):  # Show first 3 keypoints
                         print(f"    Keypoint {j}: {kp.get('name', f'kp_{j}')} at ({kp.get('x', 0):.3f}, {kp.get('y', 0):.3f}) with confidence {kp.get('confidence', 0):.3f}")
             else:
-                print("Preview: No keypoints found")
+                print("No actual predictions to draw")
             
             # Save processed frame
             output_path = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
@@ -405,8 +495,8 @@ def preview_first_frame(api_key, workspace_name, project_name, version_number, v
             # Clean up temporary frame file
             os.unlink(temp_frame_path.name)
             
-            total_keypoints = sum(len(pred.get('keypoints', [])) for pred in prediction.get('predictions', []))
-            return output_path.name, f"Preview: Found {len(prediction.get('predictions', []))} predictions with {total_keypoints} total keypoints on first frame"
+            total_keypoints = sum(len(pred.get('keypoints', [])) for pred in actual_predictions)
+            return output_path.name, f"Preview: Found {len(actual_predictions)} predictions with {total_keypoints} total keypoints on first frame"
             
         except Exception as e:
             # Clean up temporary frame file
