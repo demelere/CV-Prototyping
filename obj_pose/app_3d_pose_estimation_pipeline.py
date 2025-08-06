@@ -736,13 +736,86 @@ class KeypointProcessor3D:
         alpha = 0.95
         combined_frame = cv2.addWeighted(combined_frame, alpha, overlay, 1-alpha, 0)
         
-        # Add geometry information overlay (create dummy predictions structure)
+        # Add geometry information overlay LAST (so it's on top and visible)
         if keypoints_3d:
+            print(f"DEBUG: Creating combined visualization with {len(keypoints_3d)} keypoints")
             # Create a dummy predictions structure for geometry calculation
             dummy_predictions = [{'keypoints': keypoints_3d}]
-            self.draw_geometry_overlay(combined_frame, dummy_predictions, depth_map, original_frame.shape[1], original_frame.shape[0])
+            self.draw_geometry_overlay_combined(combined_frame, dummy_predictions, depth_map, original_frame.shape[1], original_frame.shape[0])
+            print("DEBUG: Called draw_geometry_overlay_combined")
+        else:
+            print("DEBUG: No keypoints_3d provided to create_combined_visualization")
         
         return combined_frame
+    
+    def draw_geometry_overlay_combined(self, frame, predictions, depth_map, img_width, img_height):
+        """Draw geometry information overlay specifically for combined visualization (more visible)"""
+        print("DEBUG: draw_geometry_overlay_combined called")
+        
+        # Collect all keypoints for geometry calculation
+        all_keypoints_3d = []
+        for prediction in predictions:
+            keypoints_3d = prediction.get('keypoints', [])
+            print(f"DEBUG: Found {len(keypoints_3d)} keypoints in prediction")
+            all_keypoints_3d.extend(keypoints_3d)
+        
+        print(f"DEBUG: Collected {len(all_keypoints_3d)} keypoints for geometry overlay")
+        
+        if not all_keypoints_3d:
+            print("DEBUG: No keypoints found for geometry overlay")
+            return
+        
+        # Calculate geometry directly from the 3D keypoints (no need to re-process)
+        pose_data = self.process_3d_pose_data(all_keypoints_3d)
+        print(f"DEBUG: Pose data calculated: electrode={pose_data['electrode_geometry'] is not None}, rod={pose_data['filler_geometry'] is not None}")
+        
+        # Draw geometry information with larger, more visible text
+        y_offset = 50
+        line_height = 40
+        
+        # Background for text (bigger and more opaque for combined view)
+        cv2.rectangle(frame, (10, 120), (700, 300), (0, 0, 0), -1)
+        print("DEBUG: Drew background rectangle for geometry overlay")
+        
+        # Electrode geometry
+        if pose_data['electrode_geometry']:
+            electrode = pose_data['electrode_geometry']
+            length_mm = electrode['length'] * 1000
+            direction = electrode['direction']
+            
+            cv2.putText(frame, f"Electrode Length: {length_mm:.1f}mm", (20, y_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 5)
+            y_offset += line_height + 20
+            
+            cv2.putText(frame, f"Direction: [{direction[0]:.2f}, {direction[1]:.2f}, {direction[2]:.2f}]", 
+                      (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 4)
+            y_offset += line_height
+            print("DEBUG: Drew electrode geometry text")
+        
+        # Rod geometry
+        if pose_data['filler_geometry']:
+            rod = pose_data['filler_geometry']
+            length_mm = rod['length'] * 1000
+            direction = rod['direction']
+            
+            cv2.putText(frame, f"Rod Length: {length_mm:.1f}mm", (20, y_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 0), 5)
+            y_offset += line_height + 20
+            
+            cv2.putText(frame, f"Direction: [{direction[0]:.2f}, {direction[1]:.2f}, {direction[2]:.2f}]", 
+                      (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 4)
+            y_offset += line_height
+            print("DEBUG: Drew rod geometry text")
+        
+        # Basic orientation angles
+        if pose_data['welding_angles']:
+            angles = pose_data['welding_angles']
+            if 'angle_to_camera_degrees' in angles:
+                cv2.putText(frame, f"Angle to Camera: {angles['angle_to_camera_degrees']:.1f}°", 
+                          (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 4)
+                print("DEBUG: Drew angle text")
+        
+        print("DEBUG: Finished drawing geometry overlay")
     
     def process_video_3d(self, video_path, progress=gr.Progress()):
         """Process video with 3D keypoint detection"""
