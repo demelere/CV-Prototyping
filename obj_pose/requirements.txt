@@ -1,10 +1,10 @@
 gradio
 opencv-python
 numpy
-Pillow
-torch
-torchvision
 roboflow
-huggingface_hub
-requests
-transformers 
+Pillow
+transformers
+torch
+scikit-learn
+scipy
+python-dotenv

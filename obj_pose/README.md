@@ -19,6 +19,8 @@ cd obj_pose
 pip install -r requirements.txt
 ```
 
+**Note:** The application now supports `.env` file configuration. If you want to use this feature, make sure `python-dotenv` is installed (it's included in requirements.txt).
+
 ### Run the Application
 
 ```bash
@@ -28,6 +30,39 @@ python app_3d_pose_estimation_pipeline.py
 The app will be available at `http://localhost:7863`
 
 ## Configuration
+
+### Environment Variables (Recommended)
+
+Create a `.env` file in the same directory as the application with your Roboflow credentials:
+
+```bash
+# Copy the example file
+cp .env.example .env
+
+# Edit with your actual values
+nano .env
+```
+
+Example `.env` file:
+```env
+ROBOFLOW_API_KEY=your_api_key_here
+ROBOFLOW_WORKSPACE=your_workspace_name
+ROBOFLOW_PROJECT=your_project_name
+ROBOFLOW_VERSION=1
+```
+
+**Benefits of using .env file:**
+- No need to enter credentials every time you run the app
+- Keeps sensitive API keys out of your code
+- Easy to switch between different projects
+
+### Manual Configuration
+
+If you prefer to enter values manually each time, you can leave the `.env` file empty or delete it. The application will prompt you to enter:
+- Roboflow API Key
+- Workspace Name  
+- Project Name
+- Version Number
 
 ### Key Parameters
 
