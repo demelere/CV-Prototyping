@@ -119,6 +119,7 @@ WORKPIECE_ROI_HEIGHT = 0.6   # Region of interest height (fraction of frame heig
 WORKPIECE_MIN_CLUSTER_SIZE = 100  # Minimum points for valid surface cluster
 WORKPIECE_DEPTH_TOLERANCE = 0.02  # Depth tolerance for plane fitting (meters)
 WORKPIECE_RANSAC_THRESHOLD = 0.01  # RANSAC threshold for plane fitting (meters)
+WORKPIECE_ELECTRODE_EXCLUSION_RADIUS = 0.125  # Electrode exclusion radius (fraction of frame size)
 
 # Travel Direction Tracking
 TRAVEL_HISTORY_LENGTH = 10   # Number of frames to track for velocity calculation
@@ -693,7 +694,6 @@ class KeypointProcessor3D:
         print(f"Processing {len(predictions)} predictions")
         
         # Detect workpiece surface on first frame or when depth map is available
-        workpiece_detected = False
         if depth_map is not None:
             # Collect all keypoints for workpiece detection
             all_keypoints_3d = []
@@ -703,12 +703,13 @@ class KeypointProcessor3D:
                     if 'x_3d' in keypoint and 'y_3d' in keypoint and 'z_3d' in keypoint:
                         all_keypoints_3d.append(keypoint)
             
-            workpiece_detected = self.workpiece_detector.detect_workpiece_surface(depth_map, img_width, img_height, all_keypoints_3d)
+            self.workpiece_detector.detect_workpiece_surface(depth_map, img_width, img_height, all_keypoints_3d)
         
-        # Draw coordinate axes and surface indicator only if workpiece is detected
-        if workpiece_detected:
-            self.draw_coordinate_axes(frame, img_width, img_height)
-            self.draw_workpiece_surface_indicator(frame, img_width, img_height)
+        # Draw coordinate axes if workpiece is detected
+        self.draw_coordinate_axes(frame, img_width, img_height)
+        
+        # Draw workpiece surface indicator
+        self.draw_workpiece_surface_indicator(frame, img_width, img_height)
         
         # Collect all keypoints for processing
         all_keypoints_3d = []
@@ -2014,8 +2015,8 @@ class WorkpieceDetector:
             return False
     
     def _detect_workpiece_with_keypoints(self, depth_map, frame_width, frame_height, keypoints_3d):
-        """Detect workpiece surface using keypoint positions to guide the search"""
-        print("DEBUG: Using keypoint-guided workpiece detection")
+        """Detect workpiece surface using background depth while excluding electrode area"""
+        print("DEBUG: Using background-based workpiece detection with electrode exclusion")
         
         # Find electrode tip position
         electrode_tip_2d = None
@@ -2032,54 +2033,66 @@ class WorkpieceDetector:
         
         print(f"DEBUG: Found electrode tip at 2D: {electrode_tip_2d}, 3D: {electrode_tip_3d}")
         
-        # Create a small ROI around the electrode tip
-        roi_size = min(frame_width, frame_height) // 4  # 25% of frame size
-        roi_x = max(0, electrode_tip_2d[0] - roi_size // 2)
-        roi_y = max(0, electrode_tip_2d[1] - roi_size // 2)
-        roi_width = min(roi_size, frame_width - roi_x)
-        roi_height = min(roi_size, frame_height - roi_y)
+        # Create a mask to exclude electrode area from surface detection
+        # Define electrode exclusion zone (larger than just the tip)
+        exclusion_radius = int(min(frame_width, frame_height) * WORKPIECE_ELECTRODE_EXCLUSION_RADIUS)
+        electrode_x, electrode_y = electrode_tip_2d
         
-        print(f"DEBUG: Keypoint-guided ROI: {roi_width}x{roi_height} at ({roi_x}, {roi_y})")
+        # Convert entire depth map to 3D points, excluding electrode area
+        points_3d = []
+        h, w = depth_map.shape
         
-        # Extract ROI from depth map
-        roi_depth = depth_map[roi_y:roi_y+roi_height, roi_x:roi_x+roi_width]
-        print(f"DEBUG: ROI depth shape: {roi_depth.shape}")
-        print(f"DEBUG: ROI depth range: {roi_depth.min()} to {roi_depth.max()}")
+        # Sample points (every 4th pixel to reduce computation)
+        for y in range(0, h, 4):
+            for x in range(0, w, 4):
+                # Check if point is within electrode exclusion zone
+                distance_to_electrode = np.sqrt((x - electrode_x)**2 + (y - electrode_y)**2)
+                if distance_to_electrode <= exclusion_radius:
+                    continue  # Skip electrode area
+                
+                depth_value = depth_map[y, x]
+                
+                # Skip invalid depth values
+                if depth_value <= 0:
+                    continue
+                
+                # Convert to real-world depth
+                depth_meters = depth_value / DEPTH_SCALE_FACTOR
+                
+                # Back-project to 3D using camera intrinsics
+                x_3d = (x - CAMERA_CX) * depth_meters / CAMERA_FX
+                y_3d = (y - CAMERA_CY) * depth_meters / CAMERA_FY
+                z_3d = depth_meters
+                
+                points_3d.append([x_3d, y_3d, z_3d])
         
-        # Convert depth map to 3D points
-        points_3d = self._depth_to_3d_points(roi_depth, roi_x, roi_y, frame_width, frame_height)
-        print(f"DEBUG: Converted {len(points_3d)} 3D points from keypoint-guided ROI")
+        points_3d = np.array(points_3d)
+        print(f"DEBUG: Converted {len(points_3d)} 3D points from background (excluding electrode area)")
+        print(f"DEBUG: Electrode exclusion radius: {exclusion_radius} pixels")
         
         if len(points_3d) < WORKPIECE_MIN_CLUSTER_SIZE:
-            print(f"Insufficient points for workpiece detection: {len(points_3d)} (need {WORKPIECE_MIN_CLUSTER_SIZE})")
+            print(f"Insufficient background points: {len(points_3d)} (need {WORKPIECE_MIN_CLUSTER_SIZE})")
             return False
         
-        # Filter points to focus on surfaces near the electrode tip depth
-        electrode_depth = electrode_tip_3d[2]
-        print(f"DEBUG: Electrode tip depth: {electrode_depth:.4f}")
+        # Filter points to focus on the CLOSEST surfaces (where workpiece likely is)
+        # Sort by Z-coordinate and take the closest 60% of points
+        z_coords = [p[2] for p in points_3d]
+        sorted_indices = np.argsort(z_coords)
+        num_closest = int(len(points_3d) * 0.6)  # Take closest 60%
+        closest_points = [points_3d[i] for i in sorted_indices[:num_closest]]
+        closest_points = np.array(closest_points)
         
-        # Take points within a depth range around the electrode tip
-        depth_tolerance = 0.01  # 10mm tolerance
-        filtered_points = []
-        for point in points_3d:
-            if abs(point[2] - electrode_depth) <= depth_tolerance:
-                filtered_points.append(point)
+        print(f"DEBUG: Filtered to {len(closest_points)} closest background points (Z range: {min(z_coords):.4f} to {max(z_coords):.4f})")
         
-        print(f"DEBUG: Filtered to {len(filtered_points)} points near electrode depth (tolerance: ±{depth_tolerance*1000:.1f}mm)")
-        
-        if len(filtered_points) < WORKPIECE_MIN_CLUSTER_SIZE:
-            print(f"Insufficient filtered points: {len(filtered_points)} (need {WORKPIECE_MIN_CLUSTER_SIZE})")
-            return False
-        
-        # Cluster the filtered points
-        clusters = self._cluster_depth_points(filtered_points)
-        print(f"DEBUG: Found {len(clusters)} clusters from keypoint-guided detection")
+        # Cluster points to find the largest flat surface
+        clusters = self._cluster_depth_points(closest_points)
+        print(f"DEBUG: Found {len(clusters)} clusters from background detection")
         
         if not clusters:
             print("No valid clusters found for workpiece detection")
             return False
         
-        # Use the largest cluster
+        # Find the largest cluster (likely the workpiece)
         largest_cluster = max(clusters, key=len)
         print(f"DEBUG: Largest cluster has {len(largest_cluster)} points")
         
@@ -2096,7 +2109,7 @@ class WorkpieceDetector:
         
         # Extract plane parameters (ax + by + cz + d = 0)
         a, b, c, d = plane_params
-        print(f"DEBUG: Keypoint-guided plane parameters: a={a:.4f}, b={b:.4f}, c={c:.4f}, d={d:.4f}")
+        print(f"DEBUG: Background-based plane parameters: a={a:.4f}, b={b:.4f}, c={c:.4f}, d={d:.4f}")
         
         # Normalize the normal vector
         normal = np.array([a, b, c])
