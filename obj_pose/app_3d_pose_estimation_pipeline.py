@@ -14,6 +14,7 @@ from scipy.spatial.distance import cdist
 from collections import deque
 import time
 from dotenv import load_dotenv
+from core.surface_normal_estimator import SurfaceNormalEstimator, visualize_surface_normals, create_normal_magnitude_map
 
 # Load environment variables from .env file
 load_dotenv()
@@ -53,6 +54,12 @@ CONNECTION_THICKNESS = 2   # Thickness of connection lines between keypoints
 KEYPOINT_COLOR = (0, 255, 0)  # Green keypoints (BGR)
 CONNECTION_COLOR = (255, 0, 0)  # Blue connections (BGR)
 DEPTH_COLOR_MAP = cv2.COLORMAP_VIRIDIS  # Color map for depth visualization
+
+# Surface Normal Estimation Parameters
+ENABLE_SURFACE_NORMALS = True  # Enable surface normal estimation
+SURFACE_NORMAL_ALPHA = 2       # Pixel distance for tangent vector construction
+SURFACE_NORMAL_R_THRESHOLD = 0.1  # Threshold for filtering erroneous normals
+SURFACE_NORMAL_COLOR_MAP = cv2.COLORMAP_PLASMA  # Color map for normal visualization
 
 # Label Display Options
 SHOW_CONFIDENCE = True             # Show confidence score in label
@@ -236,6 +243,18 @@ class KeypointProcessor3D:
             print("Initializing travel tracker...")
             self.travel_tracker = TravelTracker()
             print("✅ Travel tracker initialized")
+            
+            # Initialize surface normal estimator
+            print("Initializing surface normal estimator...")
+            self.surface_normal_estimator = SurfaceNormalEstimator(
+                fx=CAMERA_FX,
+                fy=CAMERA_FY,
+                ox=CAMERA_CX,
+                oy=CAMERA_CY,
+                alpha=SURFACE_NORMAL_ALPHA,
+                r_threshold=SURFACE_NORMAL_R_THRESHOLD
+            )
+            print("✅ Surface normal estimator initialized")
                 
         except Exception as e:
             print(f"❌ Error in KeypointProcessor3D.__init__: {e}")
@@ -293,6 +312,7 @@ class KeypointProcessor3D:
         # Y = (v - cy) * Z / fy
         x_3d = (pixel_x - CAMERA_CX) * depth_meters / CAMERA_FX
         y_3d = (pixel_y - CAMERA_CY) * depth_meters / CAMERA_FY
+        
         z_3d = depth_meters
         
         print(f"DEBUG: 3D coordinates: x={x_3d}, y={y_3d}, z={z_3d}")
@@ -704,9 +724,29 @@ class KeypointProcessor3D:
                         all_keypoints_3d.append(keypoint)
             
             self.workpiece_detector.detect_workpiece_surface(depth_map, img_width, img_height, all_keypoints_3d)
-        
-        # Draw coordinate axes if workpiece is detected
-        self.draw_coordinate_axes(frame, img_width, img_height)
+            
+            # Draw workpiece coordinate axes based on surface normal analysis
+            if ENABLE_SURFACE_NORMALS:
+                try:
+                    # Estimate surface normals from depth map
+                    normals = self.surface_normal_estimator.estimate_normals(depth_map)
+                    
+                    # Extract workpiece coordinate system
+                    x_axis, y_axis, z_axis = self._extract_workpiece_coordinate_system(normals, depth_map)
+                    
+                    # Draw workpiece coordinate axes
+                    self._draw_workpiece_coordinate_axes(frame, x_axis, y_axis, z_axis, img_width, img_height)
+                    
+                except Exception as e:
+                    print(f"Warning: Could not draw workpiece coordinate axes: {e}")
+                    # Fall back to legacy coordinate axes
+                    self.draw_coordinate_axes(frame, img_width, img_height)
+            else:
+                # Draw legacy coordinate axes if surface normals are disabled
+                self.draw_coordinate_axes(frame, img_width, img_height)
+        else:
+            # Draw coordinate axes if workpiece is detected (legacy)
+            self.draw_coordinate_axes(frame, img_width, img_height)
         
         # Draw workpiece surface indicator
         self.draw_workpiece_surface_indicator(frame, img_width, img_height)
@@ -1226,7 +1266,281 @@ class KeypointProcessor3D:
         h, w = original_frame.shape[:2]
         depth_colored = cv2.resize(depth_colored, (w, h))
         
+        # Add title overlay
+        overlay = np.zeros_like(depth_colored)
+        cv2.rectangle(overlay, (10, 10), (400, 80), (0, 0, 0), -1)
+        cv2.putText(overlay, "Depth Map", (20, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+        depth_colored = cv2.addWeighted(depth_colored, 0.9, overlay, 0.1, 0)
+        
         return depth_colored
+    
+    def _add_normal_statistics_overlay(self, frame, stats):
+        """Add surface normal statistics overlay to the frame"""
+        y_offset = 120
+        line_height = 30
+        
+        # Background for statistics
+        cv2.rectangle(frame, (10, 100), (400, 200), (0, 0, 0), -1)
+        
+        # Add statistics text
+        cv2.putText(frame, f"Valid Pixels: {stats['valid_pixels']}/{stats['total_pixels']} ({stats['valid_percentage']:.1f}%)", 
+                   (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        y_offset += line_height
+        
+        mean_normal = stats['mean_normal']
+        cv2.putText(frame, f"Mean Normal: [{mean_normal[0]:.3f}, {mean_normal[1]:.3f}, {mean_normal[2]:.3f}]", 
+                   (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        y_offset += line_height
+        
+        std_normal = stats['std_normal']
+        cv2.putText(frame, f"Std Normal: [{std_normal[0]:.3f}, {std_normal[1]:.3f}, {std_normal[2]:.3f}]", 
+                   (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    def create_surface_normal_visualization(self, depth_map, original_frame):
+        """Create a dedicated surface normal visualization"""
+        if depth_map is None or not ENABLE_SURFACE_NORMALS:
+            return None
+        
+        try:
+            # Estimate surface normals from depth map
+            normals = self.surface_normal_estimator.estimate_normals(depth_map)
+            
+            # Get frame dimensions
+            h, w = original_frame.shape[:2]
+            
+            # Create normal visualization
+            normal_vis = self.surface_normal_estimator.create_visualization(normals, (w, h))
+            
+            # Create magnitude map for better visualization
+            magnitude_map = create_normal_magnitude_map(normals)
+            magnitude_colored = cv2.applyColorMap(magnitude_map, SURFACE_NORMAL_COLOR_MAP)
+            magnitude_colored = cv2.resize(magnitude_colored, (w, h))
+            
+            # Get normal statistics
+            stats = self.surface_normal_estimator.get_normal_statistics(normals)
+            
+            # Add statistics overlay
+            self._add_normal_statistics_overlay(magnitude_colored, stats)
+            
+            # Add title overlay
+            overlay = np.zeros_like(magnitude_colored)
+            cv2.rectangle(overlay, (10, 10), (600, 80), (0, 0, 0), -1)
+            cv2.putText(overlay, "Surface Normal Map", (20, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+            magnitude_colored = cv2.addWeighted(magnitude_colored, 0.9, overlay, 0.1, 0)
+            
+            return magnitude_colored
+            
+        except Exception as e:
+            print(f"Warning: Surface normal visualization failed: {e}")
+            return None
+    
+    def create_surface_normal_depth_combo(self, depth_map, original_frame):
+        """Create a combined visualization of surface normals + depth map with coordinate axes"""
+        if depth_map is None or not ENABLE_SURFACE_NORMALS:
+            return None
+        
+        try:
+            # Estimate surface normals from depth map
+            normals = self.surface_normal_estimator.estimate_normals(depth_map)
+            
+            # Get frame dimensions
+            h, w = original_frame.shape[:2]
+            
+            # Create depth visualization
+            depth_colored = cv2.applyColorMap(depth_map, DEPTH_COLOR_MAP)
+            depth_colored = cv2.resize(depth_colored, (w, h))
+            
+            # Create magnitude map for surface normals
+            magnitude_map = create_normal_magnitude_map(normals)
+            magnitude_colored = cv2.applyColorMap(magnitude_map, SURFACE_NORMAL_COLOR_MAP)
+            magnitude_colored = cv2.resize(magnitude_colored, (w, h))
+            
+            # Combine depth and surface normal magnitude
+            combined_vis = cv2.addWeighted(depth_colored, 0.6, magnitude_colored, 0.4, 0)
+            
+            # Extract workpiece coordinate system from background
+            x_axis, y_axis, z_axis = self._extract_workpiece_coordinate_system(normals, depth_map)
+            
+            # Draw coordinate axes with workpiece coordinate system
+            self._draw_workpiece_coordinate_axes(combined_vis, x_axis, y_axis, z_axis, w, h)
+            
+            # Add title overlay
+            overlay = np.zeros_like(combined_vis)
+            cv2.rectangle(overlay, (10, 10), (600, 80), (0, 0, 0), -1)
+            cv2.putText(overlay, "Depth + Surface Normals + Workpiece Coordinate System", (20, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            combined_vis = cv2.addWeighted(combined_vis, 0.9, overlay, 0.1, 0)
+            
+            return combined_vis
+            
+        except Exception as e:
+            print(f"Warning: Surface normal depth combo failed: {e}")
+            return None
+    
+    def _extract_workpiece_coordinate_system(self, normals, depth_map):
+        """Extract the workpiece coordinate system from surface normals and depth gradient"""
+        try:
+            # Get valid normal pixels
+            valid_pixels = normals.any(axis=2)
+            
+            if not valid_pixels.any():
+                return None, None, None
+            
+            # Get all valid normal vectors
+            valid_normals = normals[valid_pixels]
+            
+            # Calculate mean normal vector (represents the dominant surface orientation)
+            # This is the Y-axis (perpendicular to the table surface)
+            mean_normal = np.mean(valid_normals, axis=0)
+            
+            # Normalize the mean normal
+            mean_normal_norm = np.linalg.norm(mean_normal)
+            if mean_normal_norm > 0:
+                y_axis = mean_normal / mean_normal_norm
+            else:
+                y_axis = np.array([0, 1, 0])  # Default Y-axis
+            
+            # Calculate depth gradient to find the direction of uniform depth change
+            # This will be our X-axis (parallel to depth gradient)
+            depth_gradient = self._calculate_depth_gradient(depth_map)
+            
+            if depth_gradient is not None:
+                # Normalize the depth gradient
+                gradient_norm = np.linalg.norm(depth_gradient)
+                if gradient_norm > 0:
+                    x_axis = depth_gradient / gradient_norm
+                else:
+                    x_axis = np.array([1, 0, 0])  # Default X-axis
+            else:
+                x_axis = np.array([1, 0, 0])  # Default X-axis
+            
+            # Z-axis is perpendicular to both X and Y axes (cross product)
+            z_axis = np.cross(x_axis, y_axis)
+            z_axis_norm = np.linalg.norm(z_axis)
+            if z_axis_norm > 0:
+                z_axis = z_axis / z_axis_norm
+            else:
+                z_axis = np.array([0, 0, 1])  # Default Z-axis
+            
+            # Ensure right-handed coordinate system
+            if np.dot(np.cross(x_axis, y_axis), z_axis) < 0:
+                z_axis = -z_axis
+            
+            print(f"DEBUG: Extracted workpiece coordinate system:")
+            print(f"  X-axis (depth gradient): {x_axis}")
+            print(f"  Y-axis (surface normal): {y_axis}")
+            print(f"  Z-axis (perpendicular): {z_axis}")
+            
+            return x_axis, y_axis, z_axis
+            
+        except Exception as e:
+            print(f"Error extracting workpiece coordinate system: {e}")
+            return None, None, None
+    
+    def _calculate_depth_gradient(self, depth_map):
+        """Calculate the direction of uniform depth change (gradient)"""
+        try:
+            # Calculate gradients in X and Y directions
+            grad_x = cv2.Sobel(depth_map, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(depth_map, cv2.CV_64F, 0, 1, ksize=3)
+            
+            # Calculate mean gradient direction
+            mean_grad_x = np.mean(grad_x)
+            mean_grad_y = np.mean(grad_y)
+            
+            # Create gradient vector (this points in the direction of increasing depth)
+            gradient = np.array([mean_grad_x, mean_grad_y, 0])  # Z component is 0 for 2D gradient
+            
+            # Normalize
+            gradient_norm = np.linalg.norm(gradient)
+            if gradient_norm > 0:
+                gradient = gradient / gradient_norm
+                print(f"DEBUG: Depth gradient direction: {gradient}")
+                return gradient
+            else:
+                print("DEBUG: No significant depth gradient found")
+                return None
+                
+        except Exception as e:
+            print(f"Error calculating depth gradient: {e}")
+            return None
+    
+    def _draw_workpiece_coordinate_axes(self, frame, x_axis, y_axis, z_axis, img_width, img_height):
+        """Draw workpiece coordinate axes based on surface normal and depth gradient"""
+        if x_axis is None or y_axis is None or z_axis is None:
+            print("DEBUG: No workpiece coordinate system available for coordinate axes")
+            return
+        
+        # Define center point for coordinate axes
+        center_x = img_width // 2
+        center_y = img_height // 2
+        
+        # Define axis length
+        axis_length = 80
+        
+        # Draw workpiece coordinate axes
+        # X-axis (red) - parallel to depth gradient
+        x_end_x = int(center_x + x_axis[0] * axis_length)
+        x_end_y = int(center_y + x_axis[1] * axis_length)
+        x_end_x = max(0, min(img_width - 1, x_end_x))
+        x_end_y = max(0, min(img_height - 1, x_end_y))
+        cv2.arrowedLine(frame, (center_x, center_y), (x_end_x, x_end_y), 
+                       (0, 0, 255), 4, tipLength=0.3)
+        cv2.putText(frame, "Workpiece X", (x_end_x + 5, x_end_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        
+        # Y-axis (green) - surface normal (perpendicular to table surface)
+        y_end_x = int(center_x + y_axis[0] * axis_length)
+        y_end_y = int(center_y + y_axis[1] * axis_length)
+        y_end_x = max(0, min(img_width - 1, y_end_x))
+        y_end_y = max(0, min(img_height - 1, y_end_y))
+        cv2.arrowedLine(frame, (center_x, center_y), (y_end_x, y_end_y), 
+                       (0, 255, 0), 4, tipLength=0.3)
+        cv2.putText(frame, "Workpiece Y", (y_end_x + 5, y_end_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # Z-axis (blue) - perpendicular to depth gradient
+        z_end_x = int(center_x + z_axis[0] * axis_length)
+        z_end_y = int(center_y + z_axis[1] * axis_length)
+        z_end_x = max(0, min(img_width - 1, z_end_x))
+        z_end_y = max(0, min(img_height - 1, z_end_y))
+        cv2.arrowedLine(frame, (center_x, center_y), (z_end_x, z_end_y), 
+                       (255, 0, 0), 4, tipLength=0.3)
+        cv2.putText(frame, "Workpiece Z", (z_end_x + 5, z_end_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+        
+        # Draw origin point
+        cv2.circle(frame, (center_x, center_y), 6, (255, 255, 255), -1)
+        
+        # Add coordinate system information
+        info_text = f"X: [{x_axis[0]:.3f}, {x_axis[1]:.3f}, {x_axis[2]:.3f}]"
+        info_text2 = f"Y: [{y_axis[0]:.3f}, {y_axis[1]:.3f}, {y_axis[2]:.3f}]"
+        info_text3 = f"Z: [{z_axis[0]:.3f}, {z_axis[1]:.3f}, {z_axis[2]:.3f}]"
+        
+        # Draw text background
+        text_size = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+        text_x = center_x - text_size[0] // 2
+        text_y = center_y + axis_length + 30
+        
+        cv2.rectangle(frame, 
+                    (text_x - 5, text_y - text_size[1] - 5),
+                    (text_x + text_size[0] + 5, text_y + text_size[1] * 3 + 10),
+                    (0, 0, 0), -1)
+        
+        # Draw text
+        cv2.putText(frame, info_text, (text_x, text_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        cv2.putText(frame, info_text2, (text_x, text_y + text_size[1] + 5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        cv2.putText(frame, info_text3, (text_x, text_y + (text_size[1] + 5) * 2), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        
+        print(f"DEBUG: Drew workpiece coordinate axes:")
+        print(f"  X-axis (depth gradient): {x_axis}")
+        print(f"  Y-axis (surface normal): {y_axis}")
+        print(f"  Z-axis (perpendicular): {z_axis}")
     
     def create_combined_visualization(self, frame_with_keypoints, depth_map, original_frame, keypoints_3d=None):
         """Create a combined visualization with keypoints overlaid on depth map"""
@@ -1763,37 +2077,37 @@ def preview_first_frame_3d(api_key, workspace_name, project_name, version_number
     """Preview 3D inference on the first frame of the video"""
     try:
         if not video_file:
-            return None, None, None, "Please upload a video file"
+            return None, None, None, None, None, "Please upload a video file"
         
         if not all([api_key, workspace_name, project_name, version_number]):
-            return None, None, None, "Please fill in all Roboflow configuration fields"
+            return None, None, None, None, None, "Please fill in all Roboflow configuration fields"
         
         # Create processor
         processor, status = create_processor_3d(api_key, workspace_name, project_name, version_number, depth_model_name)
         if processor is None:
-            return None, None, None, status
+            return None, None, None, None, None, status
         
         # Additional check for None model
         if processor.model is None:
-            return None, None, None, "Error: Model failed to load - check your Roboflow configuration"
+            return None, None, None, None, None, "Error: Model failed to load - check your Roboflow configuration"
         
         # Handle video file path
         video_path = video_file if isinstance(video_file, str) else video_file.name
         
         # Check if file exists
         if not os.path.exists(video_path):
-            return None, None, None, f"Video file not found: {video_path}"
+            return None, None, None, None, None, f"Video file not found: {video_path}"
         
         # Extract first frame
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return None, None, None, "Error: Could not open video file"
+            return None, None, None, None, None, "Error: Could not open video file"
         
         ret, frame = cap.read()
         cap.release()
         
         if not ret:
-            return None, None, None, "Error: Could not read first frame"
+            return None, None, None, None, None, "Error: Could not read first frame"
         
         # Save frame temporarily
         temp_frame_path = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
@@ -1861,6 +2175,24 @@ def preview_first_frame_3d(api_key, workspace_name, project_name, version_number
             depth_visualization = None
             if SHOW_DEPTH_MAP and depth_map is not None:
                 depth_visualization = processor.create_depth_visualization(depth_map, frame)
+            
+            # Create surface normal visualization
+            surface_normal_visualization = None
+            if ENABLE_SURFACE_NORMALS and depth_map is not None:
+                surface_normal_visualization = processor.create_surface_normal_visualization(depth_map, frame)
+                if surface_normal_visualization is not None:
+                    print("✅ Surface normal visualization created")
+                else:
+                    print("⚠️ Surface normal visualization failed")
+            
+            # Create surface normal + depth combo visualization
+            surface_normal_depth_combo = None
+            if ENABLE_SURFACE_NORMALS and depth_map is not None:
+                surface_normal_depth_combo = processor.create_surface_normal_depth_combo(depth_map, frame)
+                if surface_normal_depth_combo is not None:
+                    print("✅ Surface normal + depth combo visualization created")
+                else:
+                    print("⚠️ Surface normal + depth combo visualization failed")
             
             # Create combined visualization
             combined_visualization = None
@@ -1952,6 +2284,20 @@ def preview_first_frame_3d(api_key, workspace_name, project_name, version_number
                 cv2.imwrite(depth_output_path.name, depth_visualization)
                 depth_output_path.close()
             
+            # Save surface normal visualization
+            surface_normal_output_path = None
+            if surface_normal_visualization is not None:
+                surface_normal_output_path = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                cv2.imwrite(surface_normal_output_path.name, surface_normal_visualization)
+                surface_normal_output_path.close()
+            
+            # Save surface normal + depth combo visualization
+            surface_normal_depth_combo_output_path = None
+            if surface_normal_depth_combo is not None:
+                surface_normal_depth_combo_output_path = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                cv2.imwrite(surface_normal_depth_combo_output_path.name, surface_normal_depth_combo)
+                surface_normal_depth_combo_output_path.close()
+            
             # Save combined visualization
             combined_output_path = None
             if combined_visualization is not None:
@@ -1965,24 +2311,28 @@ def preview_first_frame_3d(api_key, workspace_name, project_name, version_number
             total_keypoints = sum(len(pred.get('keypoints', [])) for pred in actual_predictions)
             depth_status = "with depth" if depth_map is not None else "without depth"
             workpiece_status = "with workpiece" if processor.workpiece_detector.get_workpiece_normal() is not None else "without workpiece"
+            surface_normal_status = "with surface normals" if surface_normal_visualization is not None else "without surface normals"
+            combo_status = "with combo" if surface_normal_depth_combo is not None else "without combo"
             
             print(f"\n=== PREVIEW SUMMARY ===")
             print(f"Keypoints: {total_keypoints} total")
             print(f"Depth: {depth_status}")
             print(f"Workpiece: {workpiece_status}")
+            print(f"Surface Normals: {surface_normal_status}")
+            print(f"Combo Visualization: {combo_status}")
             
-            return output_path.name, depth_output_path.name if depth_output_path else None, combined_output_path.name if combined_output_path else None, f"Preview: Found {len(actual_predictions)} predictions with {total_keypoints} total keypoints {depth_status} {workpiece_status}"
+            return output_path.name, depth_output_path.name if depth_output_path else None, surface_normal_output_path.name if surface_normal_output_path else None, surface_normal_depth_combo_output_path.name if surface_normal_depth_combo_output_path else None, combined_output_path.name if combined_output_path else None, f"Preview: Found {len(actual_predictions)} predictions with {total_keypoints} total keypoints {depth_status} {workpiece_status} {surface_normal_status} {combo_status}"
             
         except Exception as e:
             # Clean up temporary frame file
             if os.path.exists(temp_frame_path.name):
                 os.unlink(temp_frame_path.name)
             print(f"Error in preview: {e}")
-            return None, None, None, f"Error during preview: {str(e)}"
+            return None, None, None, None, None, f"Error during preview: {str(e)}"
             
     except Exception as e:
         print(f"Error in preview_first_frame_3d: {e}")
-        return None, None, None, f"Error: {str(e)}"
+        return None, None, None, None, None, f"Error: {str(e)}"
 
 class WorkpieceDetector:
     def __init__(self):
@@ -2582,7 +2932,7 @@ class TravelTracker:
 # Create Gradio interface
 with gr.Blocks(title="3D Keypoint Detection with Pipeline API", theme=gr.themes.Soft()) as demo:
     gr.Markdown("# 🎯 3D Keypoint Detection with Pipeline API")
-    gr.Markdown("Upload a video and process it with 2D keypoints + depth estimation for 3D pose analysis")
+    gr.Markdown("Upload a video and process it with 2D keypoints + depth estimation + surface normal estimation for 3D pose analysis")
     
     with gr.Row():
         with gr.Column(scale=1):
@@ -2677,17 +3027,19 @@ with gr.Blocks(title="3D Keypoint Detection with Pipeline API", theme=gr.themes.
             - Label Format: {LABEL_FORMAT}
             - Show 3D Coordinates: {SHOW_3D_COORDINATES}
             - Show Depth Map: {SHOW_DEPTH_MAP}
+            - Surface Normal Estimation: {ENABLE_SURFACE_NORMALS}
             
             **Visual Settings:**
             - Keypoint Color: Green (or depth-based)
             - Connection Color: Blue
             - Depth Color Map: {DEPTH_COLOR_MAP}
+            - Surface Normal Color Map: {SURFACE_NORMAL_COLOR_MAP}
             
             **Workflow:**
             1. Upload video and configure settings
             2. Click "Preview First Frame" to test inference
             3. If preview looks good, click "Process Video"
-            4. Download the processed video with 3D keypoints
+            4. Download the processed video with 3D keypoints and surface normals
             """)
     
     with gr.Row():
@@ -2701,6 +3053,16 @@ with gr.Blocks(title="3D Keypoint Detection with Pipeline API", theme=gr.themes.
             
             preview_depth = gr.Image(
                 label="Preview: Depth Map Visualization",
+                type="filepath"
+            )
+            
+            preview_surface_normals = gr.Image(
+                label="Preview: Surface Normal Map",
+                type="filepath"
+            )
+            
+            preview_surface_normal_depth_combo = gr.Image(
+                label="Preview: Surface Normals + Depth + Workpiece Coordinate System",
                 type="filepath"
             )
             
@@ -2733,7 +3095,7 @@ with gr.Blocks(title="3D Keypoint Detection with Pipeline API", theme=gr.themes.
     preview_btn.click(
         fn=preview_first_frame_3d,
         inputs=[api_key, workspace_name, project_name, version_number, depth_model_name, video_input],
-        outputs=[preview_image, preview_depth, preview_combined, status_text]
+        outputs=[preview_image, preview_depth, preview_surface_normals, preview_surface_normal_depth_combo, preview_combined, status_text]
     )
     
     process_btn.click(
