@@ -1,0 +1,17 @@
+Depth Estimation Log - 20250826_222117
+==================================================
+
+Source image: /private/var/folders/vv/2f163whj0gs95clg1zy2n49r0000gn/T/gradio/66c50a4ccb7a2e48f78f33551e180beeda3ff084dacf2a5e9a2c3ee5cb2f380a/IMG_7506.jpeg
+Depth array shape: (5712, 4284)
+Depth array dtype: float32
+Depth range: [0.100, 10.000] meters
+Depth mean: 4.564 meters
+Depth std: 2.919 meters
+Unique values: 256
+
+Sample depth values:
+  top-left (1071, 1428): 1.459m
+  center (2142, 2856): 8.331m
+  top-right (3213, 1428): 2.158m
+  bottom-left (1071, 4284): 9.068m
+  bottom-right (3213, 4284): 6.661m
