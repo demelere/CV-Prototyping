@@ -21,3 +21,7 @@ tqdm>=4.65.0
 
 # Optional: For enhanced visualizations
 matplotlib>=3.7.0
+
+# Metadata extraction dependencies
+# Note: ffmpeg/ffprobe should be installed separately for video metadata extraction
+# Install with: brew install ffmpeg (macOS) or apt-get install ffmpeg (Ubuntu)

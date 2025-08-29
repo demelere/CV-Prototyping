@@ -15,6 +15,7 @@ from datetime import datetime
 
 from core.depth_estimator import DepthEstimatorPipeline
 from core.surface_normal_estimator import GridBasedSurfaceNormalEstimator
+from utils.metadata_extractor import CameraMetadataExtractor
 
 # ============================================================================
 # CONFIGURATION PARAMETERS
@@ -39,6 +40,17 @@ ARROW_LENGTH = 60.0        # Length of normal arrows (pixels)
 ARROW_THICKNESS = 3        # Thickness of arrow lines
 ARROW_COLOR = (0, 255, 0)  # Green arrows (BGR format)
 
+# Camera Intrinsic Parameters (these should ideally be detected from the image metadata)
+# Default values based on typical camera setups
+CAMERA_FX = 1512.0         # Focal length X (pixels) - adjust based on your camera
+CAMERA_FY = 1512.0         # Focal length Y (pixels) - adjust based on your camera  
+CAMERA_CX = 1080.0         # Principal point X (pixels) - typically image_width/2
+CAMERA_CY = 607.0          # Principal point Y (pixels) - typically image_height/2
+
+# Processing mode selection
+USE_3D_BACKPROJECTION = True  # Set to True for proper 3D back-projection, False for simple gradient
+EXTRACT_CAMERA_INTRINSICS = True  # Set to True to extract intrinsics from image/video metadata
+
 # ============================================================================
 # CORE PROCESSING CLASSES
 # ============================================================================
@@ -54,23 +66,67 @@ class DepthProcessor:
             self.depth_estimator = DepthEstimatorPipeline(depth_model_name, enable_logging=True)
             print("✅ Depth estimator pipeline initialized")
             
-            # Initialize surface normal estimator
+            # Initialize metadata extractor
+            print("Initializing camera metadata extractor...")
+            self.metadata_extractor = CameraMetadataExtractor()
+            print("✅ Camera metadata extractor initialized")
+            
+            # Initialize surface normal estimator with default parameters
+            # (will be updated with extracted intrinsics per image/video)
             print("Initializing surface normal estimator...")
             self.surface_normal_estimator = GridBasedSurfaceNormalEstimator(
+                fx=CAMERA_FX,
+                fy=CAMERA_FY,
+                cx=CAMERA_CX,
+                cy=CAMERA_CY,
                 grid_size=GRID_SIZE,
                 arrow_length=ARROW_LENGTH,
                 arrow_thickness=ARROW_THICKNESS
             )
             print("✅ Surface normal estimator initialized")
             
+            # Store extracted intrinsics for video processing (same intrinsics for all frames)
+            self.cached_video_intrinsics = None
+            
         except Exception as e:
             print(f"❌ Error initializing processor: {e}")
             raise e
     
-    def process_image(self, image_path):
+    def process_image(self, image_path, use_cached_intrinsics=False):
         """Process a single image for depth estimation and surface normals"""
         try:
             print(f"Processing image: {image_path}")
+            
+            # Extract camera intrinsics from image metadata if enabled
+            if EXTRACT_CAMERA_INTRINSICS and not use_cached_intrinsics:
+                print("🔍 Extracting camera intrinsics from image metadata...")
+                intrinsics = self.metadata_extractor.extract_from_image(image_path)
+                
+                # Log extracted intrinsics
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                log_file = f"logs/extracted_intrinsics_{timestamp}.txt"
+                self.metadata_extractor.log_intrinsics(intrinsics, log_file)
+                
+                # Update surface normal estimator with extracted intrinsics
+                self.surface_normal_estimator.fx = intrinsics.fx
+                self.surface_normal_estimator.fy = intrinsics.fy
+                self.surface_normal_estimator.cx = intrinsics.cx
+                self.surface_normal_estimator.cy = intrinsics.cy
+                
+                print(f"✅ Updated camera intrinsics: fx={intrinsics.fx:.1f}, fy={intrinsics.fy:.1f}, cx={intrinsics.cx:.1f}, cy={intrinsics.cy:.1f}")
+                print(f"   Source: {intrinsics.source}, Confidence: {intrinsics.confidence}")
+                print(f"   Camera: {intrinsics.camera_model}")
+                
+            elif use_cached_intrinsics and self.cached_video_intrinsics:
+                # Use cached intrinsics from video
+                intrinsics = self.cached_video_intrinsics
+                self.surface_normal_estimator.fx = intrinsics.fx
+                self.surface_normal_estimator.fy = intrinsics.fy
+                self.surface_normal_estimator.cx = intrinsics.cx
+                self.surface_normal_estimator.cy = intrinsics.cy
+            else:
+                print("📐 Using default camera intrinsics")
             
             # Get depth estimation
             depth_map = self.depth_estimator.estimate_depth(image_path)
@@ -89,9 +145,15 @@ class DepthProcessor:
             depth_visualization = self.depth_estimator.create_depth_visualization(depth_map, DEPTH_COLOR_MAP)
             depth_visualization = cv2.resize(depth_visualization, (w, h))
             
-            # Estimate surface normals using simple gradient method
+            # Estimate surface normals using either 3D back-projection or simple gradient method
             print("Computing surface normals...")
-            normal_map, grid_data = self.surface_normal_estimator.estimate_grid_normals_simple(depth_map)
+            if USE_3D_BACKPROJECTION:
+                print("Using 3D back-projection with camera intrinsics...")
+                normal_map, point_cloud_3d, grid_data = self.surface_normal_estimator.estimate_grid_normals_3d(depth_map)
+                print(f"✅ Generated 3D point cloud with shape: {point_cloud_3d.shape}")
+            else:
+                print("Using simple gradient method...")
+                normal_map, grid_data = self.surface_normal_estimator.estimate_grid_normals_simple(depth_map)
             
             # Create surface normal arrow visualization using enhanced method
             surface_normal_vis = self.surface_normal_estimator.create_enhanced_arrow_visualization(
@@ -108,6 +170,27 @@ class DepthProcessor:
     def process_video(self, video_path, progress=gr.Progress()):
         """Process video with depth estimation and surface normals"""
         try:
+            print(f"Processing video: {video_path}")
+            
+            # Extract camera intrinsics from video metadata if enabled
+            if EXTRACT_CAMERA_INTRINSICS:
+                print("🔍 Extracting camera intrinsics from video metadata...")
+                self.cached_video_intrinsics = self.metadata_extractor.extract_from_video(video_path)
+                
+                # Log extracted intrinsics
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                log_file = f"logs/extracted_video_intrinsics_{timestamp}.txt"
+                self.metadata_extractor.log_intrinsics(self.cached_video_intrinsics, log_file)
+                
+                print(f"✅ Extracted video intrinsics: fx={self.cached_video_intrinsics.fx:.1f}, fy={self.cached_video_intrinsics.fy:.1f}")
+                print(f"   Source: {self.cached_video_intrinsics.source}, Confidence: {self.cached_video_intrinsics.confidence}")
+                print(f"   Camera: {self.cached_video_intrinsics.camera_model}")
+                print("   📝 These intrinsics will be used for all frames in this video")
+            else:
+                print("📐 Using default camera intrinsics for video processing")
+                self.cached_video_intrinsics = None
+            
             # Open video
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
@@ -165,8 +248,8 @@ class DepthProcessor:
                 temp_frame_path.close()
                 
                 try:
-                    # Process frame
-                    depth_vis, normal_vis, status = self.process_image(temp_frame_path.name)
+                    # Process frame using cached video intrinsics
+                    depth_vis, normal_vis, status = self.process_image(temp_frame_path.name, use_cached_intrinsics=True)
                     
                     # Clean up temporary frame file
                     os.unlink(temp_frame_path.name)
@@ -328,12 +411,26 @@ with gr.Blocks(title="Depth Estimation & Surface Normals", theme=gr.themes.Soft(
             - Depth Color Map: {DEPTH_COLOR_MAP}
             - Grid Size: {GRID_SIZE}px
             - Arrow Length: {ARROW_LENGTH}px
+            - 3D Back-Projection: {'Enabled' if USE_3D_BACKPROJECTION else 'Disabled'}
+            - Metadata Extraction: {'Enabled' if EXTRACT_CAMERA_INTRINSICS else 'Disabled'}
+            
+            **Camera Intrinsics:**
+            - Auto-Extract from EXIF/Metadata: {'✅ Yes' if EXTRACT_CAMERA_INTRINSICS else '❌ No'}
+            - Fallback: fx={CAMERA_FX}, fy={CAMERA_FY}, cx={CAMERA_CX}, cy={CAMERA_CY}
+            - Camera Type: Monocular (Depth-Anything-V2)
+            - Supports: iPhone, DSLR, generic cameras
             
             **Workflow:**
-            1. Upload image/video
+            1. Upload image/video (EXIF metadata will be automatically extracted)
             2. Click "Preview Image" to see depth & surface normals
-            3. Click "Process Video" for full video processing
+            3. Click "Process Video" for full video processing (uses same intrinsics for all frames)
             4. Download processed results with depth & surface normal visualization
+            5. Check logs/ directory for extracted camera intrinsics and 3D analysis
+            
+            **Supported Metadata:**
+            - Image: EXIF data (focal length, camera model, sensor size)
+            - Video: Metadata tags, first frame EXIF analysis
+            - Fallback: Intelligent estimation based on resolution and camera type
             """)
         
         with gr.Column(scale=1):
