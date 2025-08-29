@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 
 from core.depth_estimator import DepthEstimatorPipeline
+from core.surface_normal_estimator import GridBasedSurfaceNormalEstimator
 
 # ============================================================================
 # CONFIGURATION PARAMETERS
@@ -32,6 +33,12 @@ DEPTH_COLOR_MAP = cv2.COLORMAP_VIRIDIS  # Color map for depth visualization
 TARGET_FPS = 15            # Target FPS for video processing
 SKIP_FRAMES = True         # Whether to skip frames to match target FPS
 
+# Surface Normal Parameters
+GRID_SIZE = 40             # Grid size for surface normal arrows (pixels)
+ARROW_LENGTH = 60.0        # Length of normal arrows (pixels)
+ARROW_THICKNESS = 3        # Thickness of arrow lines
+ARROW_COLOR = (0, 255, 0)  # Green arrows (BGR format)
+
 # ============================================================================
 # CORE PROCESSING CLASSES
 # ============================================================================
@@ -47,24 +54,33 @@ class DepthProcessor:
             self.depth_estimator = DepthEstimatorPipeline(depth_model_name, enable_logging=True)
             print("✅ Depth estimator pipeline initialized")
             
+            # Initialize surface normal estimator
+            print("Initializing surface normal estimator...")
+            self.surface_normal_estimator = GridBasedSurfaceNormalEstimator(
+                grid_size=GRID_SIZE,
+                arrow_length=ARROW_LENGTH,
+                arrow_thickness=ARROW_THICKNESS
+            )
+            print("✅ Surface normal estimator initialized")
+            
         except Exception as e:
             print(f"❌ Error initializing processor: {e}")
             raise e
     
     def process_image(self, image_path):
-        """Process a single image for depth estimation"""
+        """Process a single image for depth estimation and surface normals"""
         try:
             print(f"Processing image: {image_path}")
             
             # Get depth estimation
             depth_map = self.depth_estimator.estimate_depth(image_path)
             if depth_map is None:
-                return None, "Error: Depth estimation failed"
+                return None, None, "Error: Depth estimation failed"
             
             # Load original image for size reference
             original_image = cv2.imread(image_path)
             if original_image is None:
-                return None, "Error: Could not load image"
+                return None, None, "Error: Could not load image"
             
             h, w = original_image.shape[:2]
             print(f"Original image dimensions: {w}x{h}")
@@ -73,20 +89,29 @@ class DepthProcessor:
             depth_visualization = self.depth_estimator.create_depth_visualization(depth_map, DEPTH_COLOR_MAP)
             depth_visualization = cv2.resize(depth_visualization, (w, h))
             
-            print("✅ Depth estimation completed successfully")
-            return depth_visualization, "Processing completed successfully"
+            # Estimate surface normals using simple gradient method
+            print("Computing surface normals...")
+            normal_map, grid_data = self.surface_normal_estimator.estimate_grid_normals_simple(depth_map)
+            
+            # Create surface normal arrow visualization using enhanced method
+            surface_normal_vis = self.surface_normal_estimator.create_enhanced_arrow_visualization(
+                original_image, grid_data, ARROW_COLOR
+            )
+            
+            print("✅ Depth estimation and surface normal computation completed successfully")
+            return depth_visualization, surface_normal_vis, "Processing completed successfully"
             
         except Exception as e:
             print(f"Error processing image: {e}")
-            return None, f"Error: {str(e)}"
+            return None, None, f"Error: {str(e)}"
     
     def process_video(self, video_path, progress=gr.Progress()):
-        """Process video with depth estimation"""
+        """Process video with depth estimation and surface normals"""
         try:
             # Open video
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
-                return None, f"Error: Could not open video file: {video_path}"
+                return None, None, f"Error: Could not open video file: {video_path}"
             
             # Get video properties
             original_fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -104,16 +129,19 @@ class DepthProcessor:
                 skip_interval = 1
                 processed_frames = total_frames
             
-            # Create temporary output file
+            # Create temporary output files
             temp_depth_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
             temp_depth_output.close()
+            temp_normal_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+            temp_normal_output.close()
             
-            # Setup video writer
+            # Setup video writers
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out_depth = cv2.VideoWriter(temp_depth_output.name, fourcc, TARGET_FPS, (width, height))
+            out_normal = cv2.VideoWriter(temp_normal_output.name, fourcc, TARGET_FPS, (width, height))
             
-            if not out_depth.isOpened():
-                return None, "Error: Could not create output video writer"
+            if not out_depth.isOpened() or not out_normal.isOpened():
+                return None, None, "Error: Could not create output video writers"
             
             frame_count = 0
             processed_count = 0
@@ -138,16 +166,18 @@ class DepthProcessor:
                 
                 try:
                     # Process frame
-                    depth_vis, status = self.process_image(temp_frame_path.name)
+                    depth_vis, normal_vis, status = self.process_image(temp_frame_path.name)
                     
                     # Clean up temporary frame file
                     os.unlink(temp_frame_path.name)
                     
-                    if depth_vis is not None:
+                    if depth_vis is not None and normal_vis is not None:
                         out_depth.write(depth_vis)
+                        out_normal.write(normal_vis)
                     else:
                         # Write original frame if processing failed
                         out_depth.write(frame)
+                        out_normal.write(frame)
                     
                 except Exception as e:
                     print(f"Error processing frame {processed_count}: {e}")
@@ -155,6 +185,7 @@ class DepthProcessor:
                         os.unlink(temp_frame_path.name)
                     # Write original frame on error
                     out_depth.write(frame)
+                    out_normal.write(frame)
                 
                 processed_count += 1
                 frame_count += 1
@@ -162,12 +193,14 @@ class DepthProcessor:
             # Clean up
             cap.release()
             out_depth.release()
+            out_normal.release()
             
-            return temp_depth_output.name, f"Successfully processed {processed_count} frames at {TARGET_FPS} FPS"
+            return (temp_depth_output.name, temp_normal_output.name, 
+                    f"Successfully processed {processed_count} frames at {TARGET_FPS} FPS")
             
         except Exception as e:
             print(f"Error in process_video: {e}")
-            return None, f"Error processing video: {str(e)}"
+            return None, None, f"Error processing video: {str(e)}"
 
 # ============================================================================
 # GRADIO INTERFACE FUNCTIONS
@@ -183,63 +216,67 @@ def create_processor():
         return None, f"Error initializing processor: {str(e)}"
 
 def preview_image(depth_model_name, image_file):
-    """Preview depth estimation on a single image"""
+    """Preview depth estimation and surface normals on a single image"""
     try:
         if not image_file:
-            return None, "Please upload an image file"
+            return None, None, "Please upload an image file"
         
         # Create processor
         processor, status = create_processor()
         if processor is None:
-            return None, status
+            return None, None, status
         
         # Process image
         image_path = image_file.name if hasattr(image_file, 'name') else image_file
-        depth_vis, process_status = processor.process_image(image_path)
+        depth_vis, normal_vis, process_status = processor.process_image(image_path)
         
-        if depth_vis is not None:
-            # Save visualization
+        if depth_vis is not None and normal_vis is not None:
+            # Save visualizations
             depth_output = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
             cv2.imwrite(depth_output.name, depth_vis)
             depth_output.close()
             
-            return depth_output.name, process_status
+            normal_output = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+            cv2.imwrite(normal_output.name, normal_vis)
+            normal_output.close()
+            
+            return depth_output.name, normal_output.name, process_status
         else:
-            return None, process_status
+            return None, None, process_status
             
     except Exception as e:
         print(f"Error in preview: {e}")
-        return None, f"Error: {str(e)}"
+        return None, None, f"Error: {str(e)}"
 
 def process_video_with_depth(depth_model_name, video_file):
-    """Process video with depth estimation"""
+    """Process video with depth estimation and surface normals"""
     try:
         if not video_file:
-            return None, "Please upload a video file"
+            return None, None, "Please upload a video file"
         
         # Create processor
         processor, status = create_processor()
         if processor is None:
-            return None, status
+            return None, None, status
         
         # Process video
         video_path = video_file.name if hasattr(video_file, 'name') else video_file
-        depth_output, process_status = processor.process_video(video_path)
+        depth_output, normal_output, process_status = processor.process_video(video_path)
         
-        return depth_output, process_status
+        return depth_output, normal_output, process_status
         
     except Exception as e:
         print(f"Error processing video: {e}")
-        return None, f"Error: {str(e)}"
+        return None, None, f"Error: {str(e)}"
 
 # ============================================================================
 # GRADIO INTERFACE
 # ============================================================================
 
 # Create Gradio interface
-with gr.Blocks(title="Depth Estimation", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# Depth Estimation from Monocular Images")
-    gr.Markdown("Upload an image or video to estimate depth using Depth-Anything-V2 models")
+with gr.Blocks(title="Depth Estimation & Surface Normals", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# Depth Estimation & Surface Normal Visualization")
+    gr.Markdown("Upload an image or video to estimate depth and compute surface normals with arrow visualization using Depth-Anything-V2 models")
     
     with gr.Row():
         with gr.Column(scale=1):
@@ -289,28 +326,40 @@ with gr.Blocks(title="Depth Estimation", theme=gr.themes.Soft()) as demo:
             **Current Settings:**
             - Target FPS: {TARGET_FPS}
             - Depth Color Map: {DEPTH_COLOR_MAP}
+            - Grid Size: {GRID_SIZE}px
+            - Arrow Length: {ARROW_LENGTH}px
             
             **Workflow:**
             1. Upload image/video
-            2. Click "Preview Image" to test on single image
+            2. Click "Preview Image" to see depth & surface normals
             3. Click "Process Video" for full video processing
-            4. Download processed results with depth visualization
+            4. Download processed results with depth & surface normal visualization
             """)
         
         with gr.Column(scale=1):
             gr.Markdown("### 📤 Output")
             
-            # Image preview output
-            preview_depth = gr.Image(
-                label="Preview: Depth Map",
-                type="filepath"
-            )
+            # Image preview outputs - side by side
+            with gr.Row():
+                preview_depth = gr.Image(
+                    label="Preview: Depth Map",
+                    type="filepath"
+                )
+                preview_normals = gr.Image(
+                    label="Preview: Surface Normals",
+                    type="filepath"
+                )
             
-            # Video processing output
-            output_depth_video = gr.Video(
-                label="Processed Video: Depth Maps",
-                format="mp4"
-            )
+            # Video processing outputs
+            with gr.Row():
+                output_depth_video = gr.Video(
+                    label="Processed Video: Depth Maps",
+                    format="mp4"
+                )
+                output_normals_video = gr.Video(
+                    label="Processed Video: Surface Normals",
+                    format="mp4"
+                )
             
             status_text = gr.Textbox(
                 label="Status",
@@ -321,13 +370,13 @@ with gr.Blocks(title="Depth Estimation", theme=gr.themes.Soft()) as demo:
     preview_btn.click(
         fn=preview_image,
         inputs=[depth_model_name, image_input],
-        outputs=[preview_depth, status_text]
+        outputs=[preview_depth, preview_normals, status_text]
     )
     
     process_video_btn.click(
         fn=process_video_with_depth,
         inputs=[depth_model_name, video_input],
-        outputs=[output_depth_video, status_text]
+        outputs=[output_depth_video, output_normals_video, status_text]
     )
 
 if __name__ == "__main__":

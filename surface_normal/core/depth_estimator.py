@@ -224,3 +224,4 @@ class DepthEstimatorPipeline:
         depth_colored = cv2.applyColorMap(depth_normalized, color_map)
         
         return depth_colored
+
