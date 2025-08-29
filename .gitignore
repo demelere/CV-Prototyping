@@ -1,3 +1,29 @@
+logs/
+# Ignore all picture and video files anywhere
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.webp
+*.svg
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+*.webm
+*.mpg
+*.mpeg
+*.3gp
+*.m4v
+*.heic
+*.heif
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
