@@ -1,3 +1,35 @@
+# Ignore common 3D model files anywhere
+*.glb
+*.gltf
+*.obj
+*.fbx
+*.stl
+*.ply
+*.3ds
+*.dae
+*.blend
+*.abc
+*.x3d
+*.usd
+*.usdz
+*.wrl
+*.off
+*.3mf
+*.amf
+*.bvh
+*.lwo
+*.lws
+*.ma
+*.mb
+*.ase
+*.c4d
+*.dxf
+*.ifc
+*.igs
+*.iges
+*.step
+*.stp
+
 logs/
 # Ignore all picture and video files anywhere
 *.jpg
