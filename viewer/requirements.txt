@@ -1,0 +1,5 @@
+rerun-sdk>=0.24.0
+trimesh>=4.0.0
+numpy>=1.21.0
+pillow>=8.0.0
+scipy>=1.7.0
