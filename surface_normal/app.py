@@ -15,6 +15,7 @@ from datetime import datetime
 
 from core.depth_estimator import DepthEstimatorPipeline
 from core.surface_normal_estimator import GridBasedSurfaceNormalEstimator
+from core.camera_pose_extractor import CameraPoseExtractor
 from utils.metadata_extractor import CameraMetadataExtractor
 
 # ============================================================================
@@ -50,6 +51,7 @@ CAMERA_CY = 607.0          # Principal point Y (pixels) - typically image_height
 # Processing mode selection
 USE_3D_BACKPROJECTION = True  # Set to True for proper 3D back-projection, False for simple gradient
 EXTRACT_CAMERA_INTRINSICS = True  # Set to True to extract intrinsics from image/video metadata
+USE_VGGT_CAMERA_POSE = True  # Set to True to use VGGT for camera pose estimation (extrinsics + intrinsics fallback)
 
 # ============================================================================
 # CORE PROCESSING CLASSES
@@ -85,48 +87,132 @@ class DepthProcessor:
             )
             print("✅ Surface normal estimator initialized")
             
+            # Initialize camera pose extractor for VGGT-based pose estimation
+            if USE_VGGT_CAMERA_POSE:
+                print("Initializing VGGT camera pose extractor...")
+                self.camera_pose_extractor = CameraPoseExtractor()
+                print("✅ VGGT camera pose extractor initialized")
+            else:
+                self.camera_pose_extractor = None
+            
             # Store extracted intrinsics for video processing (same intrinsics for all frames)
             self.cached_video_intrinsics = None
+            # Store camera extrinsics for fixed camera scenarios (from first frame)
+            self.cached_camera_extrinsics = None
             
         except Exception as e:
             print(f"❌ Error initializing processor: {e}")
             raise e
+    
+    def extract_first_frame_from_video(self, video_path):
+        """Extract the first frame from a video file for preview purposes"""
+        try:
+            print(f"Extracting first frame from video: {video_path}")
+            
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                print(f"❌ Could not open video file: {video_path}")
+                return None
+            
+            # Read the first frame
+            ret, frame = cap.read()
+            if not ret:
+                print(f"❌ Could not read first frame from video: {video_path}")
+                cap.release()
+                return None
+            
+            # Get video properties for logging
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            print(f"✅ Extracted first frame: {width}x{height}, {fps} fps, {total_frames} total frames")
+            
+            cap.release()
+            
+            # Save the first frame as a temporary image file
+            temp_frame_path = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+            cv2.imwrite(temp_frame_path.name, frame)
+            temp_frame_path.close()
+            
+            return temp_frame_path.name
+            
+        except Exception as e:
+            print(f"❌ Error extracting first frame: {e}")
+            return None
     
     def process_image(self, image_path, use_cached_intrinsics=False):
         """Process a single image for depth estimation and surface normals"""
         try:
             print(f"Processing image: {image_path}")
             
-            # Extract camera intrinsics from image metadata if enabled
+            # Extract camera parameters (intrinsics and extrinsics)
+            metadata_intrinsics = None
+            
+            # First try to extract intrinsics from metadata if enabled
             if EXTRACT_CAMERA_INTRINSICS and not use_cached_intrinsics:
                 print("🔍 Extracting camera intrinsics from image metadata...")
-                intrinsics = self.metadata_extractor.extract_from_image(image_path)
+                metadata_intrinsics_obj = self.metadata_extractor.extract_from_image(image_path)
                 
-                # Log extracted intrinsics
-                from datetime import datetime
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                log_file = f"logs/extracted_intrinsics_{timestamp}.txt"
-                self.metadata_extractor.log_intrinsics(intrinsics, log_file)
-                
-                # Update surface normal estimator with extracted intrinsics
-                self.surface_normal_estimator.fx = intrinsics.fx
-                self.surface_normal_estimator.fy = intrinsics.fy
-                self.surface_normal_estimator.cx = intrinsics.cx
-                self.surface_normal_estimator.cy = intrinsics.cy
-                
-                print(f"✅ Updated camera intrinsics: fx={intrinsics.fx:.1f}, fy={intrinsics.fy:.1f}, cx={intrinsics.cx:.1f}, cy={intrinsics.cy:.1f}")
-                print(f"   Source: {intrinsics.source}, Confidence: {intrinsics.confidence}")
-                print(f"   Camera: {intrinsics.camera_model}")
-                
+                if metadata_intrinsics_obj and metadata_intrinsics_obj.fx > 0:
+                    metadata_intrinsics = {
+                        'fx': metadata_intrinsics_obj.fx,
+                        'fy': metadata_intrinsics_obj.fy, 
+                        'cx': metadata_intrinsics_obj.cx,
+                        'cy': metadata_intrinsics_obj.cy
+                    }
+                    
+                    # Log extracted intrinsics
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    log_file = f"logs/extracted_intrinsics_{timestamp}.txt"
+                    self.metadata_extractor.log_intrinsics(metadata_intrinsics_obj, log_file)
+                    
+                    print(f"✅ Extracted camera intrinsics: fx={metadata_intrinsics_obj.fx:.1f}, fy={metadata_intrinsics_obj.fy:.1f}, cx={metadata_intrinsics_obj.cx:.1f}, cy={metadata_intrinsics_obj.cy:.1f}")
+                    print(f"   Source: {metadata_intrinsics_obj.source}, Confidence: {metadata_intrinsics_obj.confidence}")
+                    print(f"   Camera: {metadata_intrinsics_obj.camera_model}")
+                    
             elif use_cached_intrinsics and self.cached_video_intrinsics:
                 # Use cached intrinsics from video
-                intrinsics = self.cached_video_intrinsics
-                self.surface_normal_estimator.fx = intrinsics.fx
-                self.surface_normal_estimator.fy = intrinsics.fy
-                self.surface_normal_estimator.cx = intrinsics.cx
-                self.surface_normal_estimator.cy = intrinsics.cy
+                metadata_intrinsics = {
+                    'fx': self.cached_video_intrinsics.fx,
+                    'fy': self.cached_video_intrinsics.fy,
+                    'cx': self.cached_video_intrinsics.cx,
+                    'cy': self.cached_video_intrinsics.cy
+                }
+                print("📐 Using cached video intrinsics")
+            
+            # Get camera intrinsics (with VGGT fallback if needed) and extrinsics
+            if USE_VGGT_CAMERA_POSE and self.camera_pose_extractor:
+                print("🎯 Getting camera pose using VGGT...")
+                
+                # Get intrinsics with fallback to VGGT
+                fx, fy, cx, cy = self.camera_pose_extractor.get_intrinsics_with_fallback(
+                    image_path, metadata_intrinsics
+                )
+                
+                # Get extrinsics (cached for fixed camera scenarios)
+                extrinsic_matrix, _ = self.camera_pose_extractor.extract_or_get_cached_pose(image_path)
+                self.cached_camera_extrinsics = extrinsic_matrix
+                
+                print(f"✅ Camera pose extracted: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+                print(f"   Extrinsics shape: {extrinsic_matrix.shape}")
+                
+            elif metadata_intrinsics:
+                # Use metadata intrinsics
+                fx, fy, cx, cy = metadata_intrinsics['fx'], metadata_intrinsics['fy'], metadata_intrinsics['cx'], metadata_intrinsics['cy']
+                print("📐 Using metadata camera intrinsics")
             else:
+                # Use default intrinsics
+                fx, fy, cx, cy = CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY
                 print("📐 Using default camera intrinsics")
+            
+            # Update surface normal estimator with final intrinsics
+            self.surface_normal_estimator.fx = fx
+            self.surface_normal_estimator.fy = fy
+            self.surface_normal_estimator.cx = cx
+            self.surface_normal_estimator.cy = cy
             
             # Get depth estimation
             depth_map = self.depth_estimator.estimate_depth(image_path)
@@ -173,23 +259,60 @@ class DepthProcessor:
             print(f"Processing video: {video_path}")
             
             # Extract camera intrinsics from video metadata if enabled
+            metadata_intrinsics = None
             if EXTRACT_CAMERA_INTRINSICS:
                 print("🔍 Extracting camera intrinsics from video metadata...")
                 self.cached_video_intrinsics = self.metadata_extractor.extract_from_video(video_path)
                 
-                # Log extracted intrinsics
-                from datetime import datetime
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                log_file = f"logs/extracted_video_intrinsics_{timestamp}.txt"
-                self.metadata_extractor.log_intrinsics(self.cached_video_intrinsics, log_file)
-                
-                print(f"✅ Extracted video intrinsics: fx={self.cached_video_intrinsics.fx:.1f}, fy={self.cached_video_intrinsics.fy:.1f}")
-                print(f"   Source: {self.cached_video_intrinsics.source}, Confidence: {self.cached_video_intrinsics.confidence}")
-                print(f"   Camera: {self.cached_video_intrinsics.camera_model}")
-                print("   📝 These intrinsics will be used for all frames in this video")
+                if self.cached_video_intrinsics and self.cached_video_intrinsics.fx > 0:
+                    metadata_intrinsics = {
+                        'fx': self.cached_video_intrinsics.fx,
+                        'fy': self.cached_video_intrinsics.fy,
+                        'cx': self.cached_video_intrinsics.cx,
+                        'cy': self.cached_video_intrinsics.cy
+                    }
+                    
+                    # Log extracted intrinsics
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    log_file = f"logs/extracted_video_intrinsics_{timestamp}.txt"
+                    self.metadata_extractor.log_intrinsics(self.cached_video_intrinsics, log_file)
+                    
+                    print(f"✅ Extracted video intrinsics: fx={self.cached_video_intrinsics.fx:.1f}, fy={self.cached_video_intrinsics.fy:.1f}")
+                    print(f"   Source: {self.cached_video_intrinsics.source}, Confidence: {self.cached_video_intrinsics.confidence}")
+                    print(f"   Camera: {self.cached_video_intrinsics.camera_model}")
+                    print("   📝 These intrinsics will be used for all frames in this video")
             else:
                 print("📐 Using default camera intrinsics for video processing")
                 self.cached_video_intrinsics = None
+            
+            # Extract camera pose from first frame for fixed camera scenarios
+            if USE_VGGT_CAMERA_POSE and self.camera_pose_extractor:
+                print("🎯 Extracting camera pose from first frame for fixed camera setup...")
+                
+                # Extract first frame for camera pose estimation
+                first_frame_path = self.extract_first_frame_from_video(video_path)
+                if first_frame_path:
+                    try:
+                        # Get camera pose from first frame (this will be cached for subsequent frames)
+                        fx, fy, cx, cy = self.camera_pose_extractor.get_intrinsics_with_fallback(
+                            first_frame_path, metadata_intrinsics
+                        )
+                        extrinsic_matrix, _ = self.camera_pose_extractor.extract_or_get_cached_pose(first_frame_path)
+                        self.cached_camera_extrinsics = extrinsic_matrix
+                        
+                        print(f"✅ Camera pose extracted from first frame: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+                        print(f"   Extrinsics shape: {extrinsic_matrix.shape}")
+                        print("   📝 This camera pose will be used for all frames in the video")
+                        
+                        # Clean up temporary first frame file
+                        os.unlink(first_frame_path)
+                        
+                    except Exception as e:
+                        print(f"⚠️  Error extracting camera pose from first frame: {e}")
+                        print("   Continuing with metadata/default intrinsics...")
+                        if first_frame_path and os.path.exists(first_frame_path):
+                            os.unlink(first_frame_path)
             
             # Open video
             cap = cv2.VideoCapture(video_path)
@@ -298,20 +421,46 @@ def create_processor():
         print(f"❌ Error creating processor: {e}")
         return None, f"Error initializing processor: {str(e)}"
 
-def preview_image(depth_model_name, image_file):
-    """Preview depth estimation and surface normals on a single image"""
+def preview_image_or_video(depth_model_name, image_file, video_file):
+    """Preview depth estimation and surface normals on an image or first frame of video"""
     try:
-        if not image_file:
-            return None, None, "Please upload an image file"
+        # Determine input type and get the file to process
+        input_file = None
+        input_type = "unknown"
+        
+        if image_file:
+            input_file = image_file.name if hasattr(image_file, 'name') else image_file
+            input_type = "image"
+            print(f"Processing image preview: {input_file}")
+        elif video_file:
+            input_file = video_file.name if hasattr(video_file, 'name') else video_file
+            input_type = "video"
+            print(f"Processing video preview (first frame): {input_file}")
+        else:
+            return None, None, "Please upload an image or video file"
         
         # Create processor
         processor, status = create_processor()
         if processor is None:
             return None, None, status
         
-        # Process image
-        image_path = image_file.name if hasattr(image_file, 'name') else image_file
-        depth_vis, normal_vis, process_status = processor.process_image(image_path)
+        # For video, extract first frame for preview
+        if input_type == "video":
+            print("🎬 Extracting first frame from video for preview...")
+            first_frame_path = processor.extract_first_frame_from_video(input_file)
+            if first_frame_path is None:
+                return None, None, "Error: Could not extract first frame from video"
+            
+            # Process the first frame
+            depth_vis, normal_vis, process_status = processor.process_image(first_frame_path)
+            
+            # Clean up temporary first frame file
+            if os.path.exists(first_frame_path):
+                os.unlink(first_frame_path)
+                
+        else:
+            # Process image directly
+            depth_vis, normal_vis, process_status = processor.process_image(input_file)
         
         if depth_vis is not None and normal_vis is not None:
             # Save visualizations
@@ -323,7 +472,8 @@ def preview_image(depth_model_name, image_file):
             cv2.imwrite(normal_output.name, normal_vis)
             normal_output.close()
             
-            return depth_output.name, normal_output.name, process_status
+            preview_status = f"Preview generated from {input_type}: {process_status}"
+            return depth_output.name, normal_output.name, preview_status
         else:
             return None, None, process_status
             
@@ -394,7 +544,7 @@ with gr.Blocks(title="Depth Estimation & Surface Normals", theme=gr.themes.Soft(
             
             with gr.Row():
                 preview_btn = gr.Button(
-                    "👁️ Preview Image",
+                    "👁️ Preview (Image or Video)",
                     variant="secondary",
                     size="sm"
                 )
@@ -422,10 +572,15 @@ with gr.Blocks(title="Depth Estimation & Surface Normals", theme=gr.themes.Soft(
             
             **Workflow:**
             1. Upload image/video (EXIF metadata will be automatically extracted)
-            2. Click "Preview Image" to see depth & surface normals
+            2. Click "Preview" to see depth & surface normals (works with both images and videos)
             3. Click "Process Video" for full video processing (uses same intrinsics for all frames)
             4. Download processed results with depth & surface normal visualization
             5. Check logs/ directory for extracted camera intrinsics and 3D analysis
+            
+            **Preview Functionality:**
+            - **Images**: Direct processing and preview
+            - **Videos**: Extracts first frame and generates preview from it
+            - **Metadata**: Automatically extracted from both image and video inputs
             
             **Supported Metadata:**
             - Image: EXIF data (focal length, camera model, sensor size)
@@ -465,8 +620,8 @@ with gr.Blocks(title="Depth Estimation & Surface Normals", theme=gr.themes.Soft(
     
     # Connect the interface
     preview_btn.click(
-        fn=preview_image,
-        inputs=[depth_model_name, image_input],
+        fn=preview_image_or_video,
+        inputs=[depth_model_name, image_input, video_input],
         outputs=[preview_depth, preview_normals, status_text]
     )
     
