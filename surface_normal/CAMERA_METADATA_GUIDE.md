@@ -110,7 +110,7 @@ CAMERA_CY = 607.0     # Principal point Y (pixels)
 
 ```bash
 cd surface_normal
-python test_metadata_extraction.py
+python tests/test_metadata_extraction.py
 ```
 
 **Test Coverage:**
