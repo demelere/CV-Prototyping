@@ -511,7 +511,7 @@ def preview_first_frame(api_key, workspace_name, project_name, version_number, v
 
 # Create Gradio interface
 with gr.Blocks(title="Keypoint Detection Video Processor", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🎯 Keypoint Detection Video Processor")
+    gr.Markdown("# Keypoint Detection Video Processor")
     gr.Markdown("Upload a video and process it with your trained keypoint detection model from Roboflow")
     
     with gr.Row():
