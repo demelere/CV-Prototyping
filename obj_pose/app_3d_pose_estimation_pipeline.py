@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from core.surface_normal_estimator import SurfaceNormalEstimator, visualize_surface_normals, create_normal_magnitude_map
 from utils.log_capture import log_capture
 from utils.depth_logger import create_depth_logger
+from utils.contact_plane_logger import contact_plane_logger
 
 # VGGT Integration for Camera Pose Extraction (Phase 2)
 try:
@@ -742,59 +743,114 @@ class KeypointProcessor3D:
             keypoints_3d (list): List of 3D keypoints
             image_path (str, optional): Path to image for VGGT camera parameter extraction
         """
-        print(f"\n=== DEBUG: Estimating Contact Plane Normal (Phase 2 with VGGT) ===")
-        print(f"DEBUG: Input parameters - depth_map shape: {depth_map.shape if depth_map is not None else 'None'}, img_size: {img_width}x{img_height}, keypoints: {len(keypoints_3d)}")
-        print(f"DEBUG: Image path for VGGT: {image_path}")
+        # Create correlation ID for this operation
+        correlation_id = contact_plane_logger.create_correlation_id("contact_plane_estimation")
+        start_time = time.time()
+        
+        contact_plane_logger.log_operation_start(
+            correlation_id, "CONTACT_PLANE_ESTIMATION",
+            depth_map_shape=depth_map.shape if depth_map is not None else "None",
+            image_size=f"{img_width}x{img_height}",
+            num_keypoints=len(keypoints_3d),
+            image_path=image_path or "None"
+        )
         
         try:
             # Extract camera parameters using VGGT (Phase 2)
+            camera_extraction_start = time.time()
             if image_path is not None:
                 fx, fy, cx, cy, extrinsic_matrix = self.extract_camera_parameters_vggt(image_path)
-                print(f"DEBUG: Using VGGT-extracted camera parameters: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
-                if extrinsic_matrix is not None:
-                    print(f"DEBUG: Extrinsic matrix shape: {extrinsic_matrix.shape}")
+                contact_plane_logger.log_camera_parameters(
+                    correlation_id, 
+                    {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}, 
+                    extrinsic_matrix
+                )
             else:
                 # Use cached or default parameters
                 if self.cached_camera_intrinsics is not None:
                     fx, fy, cx, cy = self.cached_camera_intrinsics
                     extrinsic_matrix = self.cached_camera_extrinsics
-                    print(f"DEBUG: Using cached camera parameters: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+                    contact_plane_logger.log_operation_success(
+                        correlation_id, "CAMERA_PARAMS_CACHED",
+                        (time.time() - camera_extraction_start) * 1000,
+                        source="cached"
+                    )
                 else:
                     fx, fy, cx, cy = CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY
                     extrinsic_matrix = None
-                    print(f"DEBUG: Using default camera parameters: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+                    contact_plane_logger.log_operation_success(
+                        correlation_id, "CAMERA_PARAMS_DEFAULT",
+                        (time.time() - camera_extraction_start) * 1000,
+                        source="default"
+                    )
+                
+                contact_plane_logger.log_camera_parameters(
+                    correlation_id, 
+                    {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}, 
+                    extrinsic_matrix
+                )
             
             # Find electrode keypoints
             electrode_tip_3d = None
             electrode_body_3d = None
             
-            print(f"DEBUG: Searching for electrode keypoints in {len(keypoints_3d)} keypoints")
+            contact_plane_logger.log_operation_start(
+                correlation_id, "ELECTRODE_KEYPOINT_DETECTION",
+                total_keypoints=len(keypoints_3d)
+            )
+            
             for i, keypoint in enumerate(keypoints_3d):
                 parent_object = keypoint.get('parent_object')
                 keypoint_class = keypoint.get('class')
-                print(f"DEBUG: Keypoint {i}: parent_object='{parent_object}', class='{keypoint_class}'")
                 
                 if parent_object == 'electrode':
                     if keypoint_class == 'tip':
                         electrode_tip_3d = np.array([keypoint['x_3d'], keypoint['y_3d'], keypoint['z_3d']])
-                        print(f"DEBUG: Found electrode tip: {electrode_tip_3d}")
+                        contact_plane_logger.log_3d_coordinates(correlation_id, "electrode_tip", electrode_tip_3d)
                     elif keypoint_class == 'body':
                         electrode_body_3d = np.array([keypoint['x_3d'], keypoint['y_3d'], keypoint['z_3d']])
-                        print(f"DEBUG: Found electrode body: {electrode_body_3d}")
+                        contact_plane_logger.log_3d_coordinates(correlation_id, "electrode_body", electrode_body_3d)
             
-            if electrode_tip_3d is None or electrode_body_3d is None:
-                print(f"DEBUG: Missing electrode keypoints - tip: {electrode_tip_3d is not None}, body: {electrode_body_3d is not None}")
+            # Check for missing keypoints
+            has_tip = electrode_tip_3d is not None
+            has_body = electrode_body_3d is not None
+            
+            contact_plane_logger.log_decision_point(
+                correlation_id, "ELECTRODE_KEYPOINTS_AVAILABLE",
+                "tip AND body keypoints found",
+                has_tip and has_body,
+                has_tip=has_tip, has_body=has_body
+            )
+            
+            if not (has_tip and has_body):
+                error_msg = f"Missing electrode keypoints - tip: {has_tip}, body: {has_body}"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "ELECTRODE_KEYPOINT_DETECTION",
+                    error_msg, (time.time() - start_time) * 1000
+                )
                 return None
             
             # Calculate electrode axis vector (from body to tip)
             electrode_axis = electrode_tip_3d - electrode_body_3d
             electrode_axis_norm = np.linalg.norm(electrode_axis)
+            
+            contact_plane_logger.log_decision_point(
+                correlation_id, "ELECTRODE_AXIS_VALID",
+                "axis magnitude > 0",
+                electrode_axis_norm > 0,
+                axis_magnitude=electrode_axis_norm
+            )
+            
             if electrode_axis_norm == 0:
-                print("ERROR: Invalid electrode axis vector")
+                error_msg = "Invalid electrode axis vector (zero magnitude)"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "ELECTRODE_AXIS_CALCULATION",
+                    error_msg, (time.time() - start_time) * 1000
+                )
                 return None
             
             electrode_axis = electrode_axis / electrode_axis_norm
-            print(f"DEBUG: Electrode axis vector: {electrode_axis}")
+            contact_plane_logger.log_3d_coordinates(correlation_id, "electrode_axis_normalized", electrode_axis)
             
             # Prepare camera intrinsics using VGGT-extracted parameters
             camera_intrinsics = {
@@ -810,35 +866,77 @@ class KeypointProcessor3D:
                 self.surface_normal_estimator.fy = fy
                 self.surface_normal_estimator.ox = cx
                 self.surface_normal_estimator.oy = cy
-                print("✅ Updated surface normal estimator with VGGT camera parameters")
+                contact_plane_logger.log_operation_success(
+                    correlation_id, "SURFACE_NORMAL_ESTIMATOR_UPDATE",
+                    0,  # No significant time
+                    source="VGGT"
+                )
             
             # Estimate contact plane normal using WorkpieceDetector
+            contact_plane_start = time.time()
             contact_plane_data = self.workpiece_detector.estimate_contact_plane_normal(
                 electrode_tip_3d, 
                 electrode_axis, 
                 depth_map, 
                 camera_intrinsics,
-                roi_radius_pixels=50  # Configurable ROI radius
+                roi_radius_pixels=50,  # Configurable ROI radius
+                correlation_id=correlation_id  # Pass correlation ID for logging
             )
+            contact_plane_duration = (time.time() - contact_plane_start) * 1000
             
             if contact_plane_data:
-                print(f"✅ Contact plane normal estimated successfully with VGGT parameters")
-                print(f"Contact normal: {contact_plane_data['normal']}")
-                print(f"Contact point: {contact_plane_data['contact_point']}")
-                print(f"Confidence: {contact_plane_data['confidence']:.3f}")
+                contact_plane_logger.log_operation_success(
+                    correlation_id, "CONTACT_PLANE_ESTIMATION",
+                    contact_plane_duration,
+                    confidence=contact_plane_data.get('confidence', 0),
+                    has_normal=contact_plane_data.get('normal') is not None,
+                    has_contact_point=contact_plane_data.get('contact_point') is not None
+                )
+                
+                # Log the results
+                if 'normal' in contact_plane_data:
+                    contact_plane_logger.log_3d_coordinates(correlation_id, "contact_plane_normal", contact_plane_data['normal'])
+                if 'contact_point' in contact_plane_data:
+                    contact_plane_logger.log_3d_coordinates(correlation_id, "contact_point_3d", contact_plane_data['contact_point'])
                 
                 # Store contact plane data for visualization
                 self.contact_plane_data = contact_plane_data
                 
+                # Log final summary
+                total_duration = (time.time() - start_time) * 1000
+                contact_plane_logger.log_summary(
+                    correlation_id, True, total_duration,
+                    {
+                        'confidence': contact_plane_data.get('confidence', 0),
+                        'roi_radius': 50,
+                        'camera_source': 'VGGT' if image_path else 'cached/default'
+                    }
+                )
+                
                 return contact_plane_data
             else:
-                print("DEBUG: Failed to estimate contact plane normal")
+                error_msg = "WorkpieceDetector returned None"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "CONTACT_PLANE_ESTIMATION",
+                    error_msg, contact_plane_duration
+                )
                 return None
                 
         except Exception as e:
-            print(f"ERROR in contact plane estimation: {e}")
-            import traceback
-            traceback.print_exc()
+            total_duration = (time.time() - start_time) * 1000
+            contact_plane_logger.log_error_with_context(
+                correlation_id, e,
+                {
+                    'operation': 'CONTACT_PLANE_ESTIMATION',
+                    'duration_ms': total_duration,
+                    'image_path': image_path or 'None',
+                    'num_keypoints': len(keypoints_3d)
+                }
+            )
+            contact_plane_logger.log_summary(
+                correlation_id, False, total_duration,
+                {'error': str(e), 'error_type': type(e).__name__}
+            )
             return None
     
     def calculate_filler_rod_geometry(self, keypoints_3d):
@@ -3505,7 +3603,7 @@ class WorkpieceDetector:
         print(f"DEBUG: Returning {len(best_clusters)} valid clusters")
         return best_clusters
     
-    def _fit_plane_to_points(self, points):
+    def _fit_plane_to_points(self, points, correlation_id=None):
         """Fit a plane to 3D points using RANSAC"""
         if len(points) < 3:
             print(f"DEBUG: Not enough points for plane fitting: {len(points)}")
@@ -4013,7 +4111,7 @@ class WorkpieceDetector:
         
         return True
     
-    def estimate_contact_plane_normal(self, electrode_tip_3d, electrode_axis, depth_map, camera_intrinsics, roi_radius_pixels=50):
+    def estimate_contact_plane_normal(self, electrode_tip_3d, electrode_axis, depth_map, camera_intrinsics, roi_radius_pixels=50, correlation_id=None):
         """
         Estimate the local plane normal at the anticipated contact region.
         
@@ -4023,14 +4121,20 @@ class WorkpieceDetector:
             depth_map (np.ndarray): Depth map (HxW)
             camera_intrinsics (dict): Camera intrinsic parameters {fx, fy, cx, cy}
             roi_radius_pixels (int): Radius of ROI around contact region in pixels
+            correlation_id (str): Correlation ID for logging
             
         Returns:
             dict: Contact plane data including normal, point, and confidence
         """
-        print(f"DEBUG: Starting contact plane normal estimation")
-        print(f"DEBUG: Electrode tip 3D: {electrode_tip_3d}")
-        print(f"DEBUG: Electrode axis: {electrode_axis}")
-        print(f"DEBUG: ROI radius: {roi_radius_pixels} pixels")
+        if correlation_id is None:
+            correlation_id = contact_plane_logger.create_correlation_id("workpiece_contact_plane")
+        
+        start_time = time.time()
+        contact_plane_logger.log_operation_start(
+            correlation_id, "WORKPIECE_CONTACT_PLANE_ESTIMATION",
+            roi_radius=roi_radius_pixels,
+            depth_map_shape=depth_map.shape
+        )
         
         try:
             # Step 1: Project electrode tip to 2D image coordinates
@@ -4039,15 +4143,27 @@ class WorkpieceDetector:
             cx = camera_intrinsics['cx']
             cy = camera_intrinsics['cy']
             
+            contact_plane_logger.log_operation_start(
+                correlation_id, "ELECTRODE_TIP_2D_PROJECTION",
+                fx=fx, fy=fy, cx=cx, cy=cy
+            )
+            
             # Convert 3D electrode tip to 2D pixel coordinates
             if electrode_tip_3d[2] <= 0:
-                print("ERROR: Invalid electrode tip depth (z <= 0)")
+                error_msg = f"Invalid electrode tip depth (z <= 0): {electrode_tip_3d[2]}"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "ELECTRODE_TIP_2D_PROJECTION",
+                    error_msg, (time.time() - start_time) * 1000
+                )
                 return None
                 
             tip_x_2d = int((electrode_tip_3d[0] * fx / electrode_tip_3d[2]) + cx)
             tip_y_2d = int((electrode_tip_3d[1] * fy / electrode_tip_3d[2]) + cy)
             
-            print(f"DEBUG: Electrode tip 2D: ({tip_x_2d}, {tip_y_2d})")
+            contact_plane_logger.log_2d_projection(
+                correlation_id, "electrode_tip", (tip_x_2d, tip_y_2d), 
+                (depth_map.shape[1], depth_map.shape[0]), True
+            )
             
             # Step 2: Create ROI around the electrode tip
             h, w = depth_map.shape
@@ -4057,9 +4173,24 @@ class WorkpieceDetector:
             roi_y2 = min(h, tip_y_2d + roi_radius_pixels)
             
             # Check if ROI is valid (not empty)
-            if roi_x1 >= roi_x2 or roi_y1 >= roi_y2:
-                print(f"ERROR: Invalid ROI - electrode tip projected outside image bounds")
-                print(f"DEBUG: Image bounds: {w}x{h}, Tip 2D: ({tip_x_2d}, {tip_y_2d}), ROI: ({roi_x1}, {roi_y1}, {roi_x2}, {roi_y2})")
+            roi_valid = not (roi_x1 >= roi_x2 or roi_y1 >= roi_y2)
+            contact_plane_logger.log_decision_point(
+                correlation_id, "ROI_VALID",
+                "ROI bounds are valid (not empty)",
+                roi_valid,
+                roi_bounds=(roi_x1, roi_y1, roi_x2, roi_y2),
+                image_size=(w, h)
+            )
+            
+            if not roi_valid:
+                error_msg = f"Invalid ROI - electrode tip projected outside image bounds"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "ROI_CREATION",
+                    error_msg, (time.time() - start_time) * 1000,
+                    image_bounds=f"{w}x{h}",
+                    tip_2d=f"({tip_x_2d}, {tip_y_2d})",
+                    roi_bounds=f"({roi_x1}, {roi_y1}, {roi_x2}, {roi_y2})"
+                )
                 return None
             
             contact_region_roi = (roi_x1, roi_y1, roi_x2, roi_y2)
@@ -4067,35 +4198,75 @@ class WorkpieceDetector:
             
             # Step 3: Extract depth ROI
             depth_roi = depth_map[roi_y1:roi_y2, roi_x1:roi_x2]
-            print(f"DEBUG: Depth ROI shape: {depth_roi.shape}")
             
             # Check if depth ROI is valid
             if depth_roi.size == 0:
-                print(f"ERROR: Empty depth ROI")
+                error_msg = "Empty depth ROI"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "DEPTH_ROI_EXTRACTION",
+                    error_msg, (time.time() - start_time) * 1000
+                )
                 return None
-                
-            print(f"DEBUG: Depth ROI range: {depth_roi.min():.3f} to {depth_roi.max():.3f}")
+            
+            # Log depth ROI analysis
+            depth_stats = {
+                'min': float(depth_roi.min()),
+                'max': float(depth_roi.max()),
+                'mean': float(depth_roi.mean()),
+                'std': float(depth_roi.std())
+            }
+            valid_pixels = np.sum(depth_roi > 0)
+            contact_plane_logger.log_roi_analysis(
+                correlation_id, (roi_x1, roi_y1, roi_x2, roi_y2), 
+                depth_stats, valid_pixels
+            )
             
             # Step 4: Convert depth ROI to 3D points
-            points_3d = self._depth_roi_to_3d_points(depth_roi, roi_x1, roi_y1, fx, fy, cx, cy)
-            print(f"DEBUG: Converted {len(points_3d)} 3D points from depth ROI")
+            points_3d = self._depth_roi_to_3d_points(depth_roi, roi_x1, roi_y1, fx, fy, cx, cy, correlation_id)
+            
+            contact_plane_logger.log_decision_point(
+                correlation_id, "SUFFICIENT_3D_POINTS",
+                "points >= 10",
+                len(points_3d) >= 10,
+                num_points=len(points_3d)
+            )
             
             if len(points_3d) < 10:
-                print(f"ERROR: Insufficient points in contact region: {len(points_3d)}")
+                error_msg = f"Insufficient points in contact region: {len(points_3d)}"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "3D_POINT_CONVERSION",
+                    error_msg, (time.time() - start_time) * 1000
+                )
                 return None
             
             # Step 5: Fit local plane using RANSAC
-            plane_params = self._fit_plane_to_points(points_3d)
+            plane_params = self._fit_plane_to_points(points_3d, correlation_id)
             if plane_params is None:
-                print("ERROR: Failed to fit plane to contact region")
+                error_msg = "Failed to fit plane to contact region"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "PLANE_FITTING",
+                    error_msg, (time.time() - start_time) * 1000
+                )
                 return None
             
             # Step 6: Extract plane normal and ensure it points toward camera
             a, b, c, d = plane_params
             normal = np.array([a, b, c])
             normal_norm = np.linalg.norm(normal)
+            
+            contact_plane_logger.log_decision_point(
+                correlation_id, "NORMAL_VECTOR_VALID",
+                "normal magnitude > 0",
+                normal_norm > 0,
+                normal_magnitude=normal_norm
+            )
+            
             if normal_norm == 0:
-                print("ERROR: Invalid normal vector")
+                error_msg = "Invalid normal vector (zero magnitude)"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "NORMAL_EXTRACTION",
+                    error_msg, (time.time() - start_time) * 1000
+                )
                 return None
             
             normal = normal / normal_norm
@@ -4105,19 +4276,65 @@ class WorkpieceDetector:
                 normal = -normal
                 d = -d
             
+            # Log plane fitting results
+            confidence = self._calculate_plane_fit_confidence(points_3d, plane_params, correlation_id)
+            inlier_ratio = 1.0  # Placeholder - would need RANSAC to return this
+            
+            contact_plane_logger.log_plane_fitting(
+                correlation_id, len(points_3d), plane_params, confidence, inlier_ratio
+            )
+            
             # Step 7: Calculate ray-plane intersection
-            contact_point = self._ray_plane_intersection(electrode_tip_3d, electrode_axis, normal, d)
+            contact_point = self._ray_plane_intersection(electrode_tip_3d, electrode_axis, normal, d, correlation_id)
             if contact_point is None:
-                print("ERROR: Failed to calculate ray-plane intersection")
+                error_msg = "Failed to calculate ray-plane intersection"
+                contact_plane_logger.log_operation_failure(
+                    correlation_id, "RAY_PLANE_INTERSECTION",
+                    error_msg, (time.time() - start_time) * 1000
+                )
                 return None
             
-            # Step 8: Calculate confidence based on plane fit quality
-            confidence = self._calculate_plane_fit_confidence(points_3d, plane_params)
+            # Log final results
+            contact_plane_logger.log_3d_coordinates(correlation_id, "contact_plane_normal", normal)
+            contact_plane_logger.log_3d_coordinates(correlation_id, "contact_point_3d", contact_point)
             
-            print(f"✅ Contact plane normal estimated successfully")
-            print(f"Contact plane normal: {normal}")
-            print(f"Contact point 3D: {contact_point}")
-            print(f"Confidence: {confidence:.3f}")
+            # Project contact point to 2D for visualization
+            if contact_point[2] > 0:
+                contact_x_2d = int((contact_point[0] * fx / contact_point[2]) + cx)
+                contact_y_2d = int((contact_point[1] * fy / contact_point[2]) + cy)
+                contact_plane_logger.log_2d_projection(
+                    correlation_id, "contact_point_2d", (contact_x_2d, contact_y_2d),
+                    (w, h), True
+                )
+                
+                # Calculate normal arrow end point for visualization
+                normal_scale = 50  # pixels
+                normal_x_2d = int(contact_x_2d + normal[0] * normal_scale)
+                normal_y_2d = int(contact_y_2d + normal[1] * normal_scale)
+                contact_plane_logger.log_2d_projection(
+                    correlation_id, "normal_arrow_end", (normal_x_2d, normal_y_2d),
+                    (w, h), True
+                )
+                
+                # Log visualization data
+                contact_plane_logger.log_visualization_data(
+                    correlation_id, (contact_x_2d, contact_y_2d), 
+                    (normal_x_2d, normal_y_2d), contact_region_roi, (w, h)
+                )
+            else:
+                contact_plane_logger.log_visualization_data(
+                    correlation_id, None, None, contact_region_roi, (w, h)
+                )
+            
+            # Log successful completion
+            total_duration = (time.time() - start_time) * 1000
+            contact_plane_logger.log_operation_success(
+                correlation_id, "WORKPIECE_CONTACT_PLANE_ESTIMATION",
+                total_duration,
+                confidence=confidence,
+                roi_size=(roi_x2-roi_x1)*(roi_y2-roi_y1),
+                num_3d_points=len(points_3d)
+            )
             
             return {
                 'normal': normal,
@@ -4128,12 +4345,18 @@ class WorkpieceDetector:
             }
             
         except Exception as e:
-            print(f"ERROR in contact plane estimation: {e}")
-            import traceback
-            traceback.print_exc()
+            total_duration = (time.time() - start_time) * 1000
+            contact_plane_logger.log_error_with_context(
+                correlation_id, e,
+                {
+                    'operation': 'WORKPIECE_CONTACT_PLANE_ESTIMATION',
+                    'duration_ms': total_duration,
+                    'roi_radius': roi_radius_pixels
+                }
+            )
             return None
     
-    def _depth_roi_to_3d_points(self, depth_roi, roi_x1, roi_y1, fx, fy, cx, cy):
+    def _depth_roi_to_3d_points(self, depth_roi, roi_x1, roi_y1, fx, fy, cx, cy, correlation_id=None):
         """Convert depth ROI to 3D points in camera coordinates"""
         points = []
         h, w = depth_roi.shape
@@ -4163,7 +4386,7 @@ class WorkpieceDetector:
         
         return np.array(points)
     
-    def _ray_plane_intersection(self, ray_origin, ray_direction, plane_normal, plane_d):
+    def _ray_plane_intersection(self, ray_origin, ray_direction, plane_normal, plane_d, correlation_id=None):
         """
         Calculate intersection point of ray with plane.
         
@@ -4182,8 +4405,12 @@ class WorkpieceDetector:
         # Calculate denominator: n · direction
         denominator = np.dot(plane_normal, ray_direction)
         
-        if abs(denominator) < 1e-6:
-            print("ERROR: Ray is parallel to plane")
+        # Check if ray is parallel to plane
+        is_parallel = abs(denominator) < 1e-6
+        if is_parallel:
+            contact_plane_logger.log_ray_plane_intersection(
+                correlation_id, ray_origin, ray_direction, None, denominator
+            )
             return None
         
         # Calculate t parameter
@@ -4192,18 +4419,20 @@ class WorkpieceDetector:
         t = -numerator / denominator
         
         # Check if intersection is in front of ray origin
-        if t < 0:
-            print(f"WARNING: Intersection is behind ray origin (t={t})")
-            # Still return the point for debugging
+        is_behind = t < 0
         
         # Calculate intersection point
         intersection_point = ray_origin + t * ray_direction
         
-        print(f"DEBUG: Ray-plane intersection: t={t:.4f}, point={intersection_point}")
+        # Log the intersection result
+        contact_plane_logger.log_ray_plane_intersection(
+            correlation_id, ray_origin, ray_direction, intersection_point, 
+            t if is_behind else None
+        )
         
         return intersection_point
     
-    def _calculate_plane_fit_confidence(self, points_3d, plane_params):
+    def _calculate_plane_fit_confidence(self, points_3d, plane_params, correlation_id=None):
         """Calculate confidence score for plane fit based on RANSAC inlier ratio"""
         if len(points_3d) < 3:
             return 0.0
