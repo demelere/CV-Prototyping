@@ -16,6 +16,20 @@ import time
 from dotenv import load_dotenv
 from core.surface_normal_estimator import SurfaceNormalEstimator, visualize_surface_normals, create_normal_magnitude_map
 from utils.log_capture import log_capture
+from utils.depth_logger import create_depth_logger
+
+# VGGT Integration for Camera Pose Extraction (Phase 2)
+try:
+    from core.camera_pose_extractor import CameraPoseExtractor
+    from utils.metadata_extractor import CameraMetadataExtractor
+    VGGT_AVAILABLE = True
+    print("✅ VGGT camera pose extraction available")
+except ImportError as e:
+    print(f"⚠️ VGGT not available: {e}")
+    print("   Contact plane estimation will use default camera parameters")
+    VGGT_AVAILABLE = False
+    CameraPoseExtractor = None
+    CameraMetadataExtractor = None
 
 # Load environment variables from .env file
 load_dotenv()
@@ -58,9 +72,16 @@ DEPTH_COLOR_MAP = cv2.COLORMAP_VIRIDIS  # Color map for depth visualization
 
 # Surface Normal Estimation Parameters
 ENABLE_SURFACE_NORMALS = True  # Enable surface normal estimation
-SURFACE_NORMAL_ALPHA = 1       # Pixel distance for tangent vector construction (reduced to avoid overflow)
+SURFACE_NORMAL_ALPHA = 10      # Pixel distance for tangent vector construction (increased for better gradients)
 SURFACE_NORMAL_R_THRESHOLD = 0.05  # Threshold for filtering erroneous normals (reduced)
 SURFACE_NORMAL_COLOR_MAP = cv2.COLORMAP_PLASMA  # Color map for normal visualization
+ROI_ALPHA_METHOD = 'min'       # Method to calculate alpha from ROI dimensions: 'min', 'max', 'mean', 'width', 'height'
+SURFACE_NORMAL_MAX_ALPHA = 50  # Maximum alpha value to prevent boundary issues
+
+# Depth Logging Parameters
+ENABLE_DEPTH_LOGGING = True    # Enable logging of raw depth map outputs
+DEPTH_LOG_SAMPLE_STRATEGY = 'corners'  # Sampling strategy: 'grid', 'random', 'corners', 'edges'
+DEPTH_LOG_MAX_FILES = 10       # Maximum number of depth log files to keep
 
 # Label Display Options
 SHOW_CONFIDENCE = True             # Show confidence score in label
@@ -82,8 +103,26 @@ CAMERA_CX = 1080.0  # Principal point X coordinate (center of 2160px width)
 CAMERA_CY = 607.0   # Principal point Y coordinate (center of 1214px height)
 
 # Depth scaling parameters
-DEPTH_SCALE_METERS = 0.11  # Convert depth values to meters (11cm per unit) - adjusted for electrode length
+DEPTH_SCALE_METERS = 1.0  # Depth values are now already in meters after conversion
 DEPTH_OFFSET = 0.0          # Depth offset in meters
+
+# VGGT Camera Pose Parameters (Phase 2)
+# ============================================================================
+# Phase 2: VGGT Integration for Accurate Camera Parameters
+# 
+# This phase replaces hardcoded camera intrinsics and extrinsics with VGGT-extracted
+# parameters for more accurate 3D pose estimation and contact plane normal calculation.
+# 
+# Key improvements:
+# - Automatic camera intrinsic extraction from image/video metadata
+# - VGGT-based camera pose estimation (extrinsics) with gravity prior
+# - Proper 3D coordinate transformations using real camera parameters
+# - More accurate ray-plane intersection for contact point estimation
+# ============================================================================
+USE_VGGT_CAMERA_POSE = True  # Enable VGGT for camera intrinsics and extrinsics
+EXTRACT_CAMERA_METADATA = True  # Extract camera intrinsics from image/video metadata
+USE_GRAVITY_PRIOR = True  # Apply gravity prior (upright camera with forward pitch)
+FORWARD_PITCH_DEGREES = 15.0  # Forward pitch angle for gravity prior
 
 # Reference measurements for calibration:
 # - Typical electrode length: 10-15cm (0.1-0.15m)
@@ -161,16 +200,59 @@ Z_AXIS_COLOR = (255, 0, 0)   # Blue for Z-axis (BGR)
 # ============================================================================
 
 class DepthEstimatorPipeline:
-    def __init__(self, model_name=DEPTH_MODEL_NAME):
+    def __init__(self, model_name=DEPTH_MODEL_NAME, enable_depth_logging=True):
         """Initialize depth estimator with Hugging Face Pipeline"""
         try:
             print(f"Loading depth estimation pipeline: {model_name}")
+            print(f"DEBUG: Model configuration - task: depth-estimation")
+            print(f"DEBUG: Model configuration - device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+            
             self.pipe = pipeline(
                 task="depth-estimation", 
                 model=model_name,
                 device="cuda" if torch.cuda.is_available() else "cpu"
             )
             print(f"✅ Depth estimation pipeline loaded successfully on {self.pipe.device}")
+            
+            # Debug pipeline configuration
+            print(f"DEBUG: Pipeline model type: {type(self.pipe.model)}")
+            print(f"DEBUG: Pipeline model name: {self.pipe.model.name_or_path}")
+            
+            # Check if we can access model config
+            if hasattr(self.pipe.model, 'config'):
+                config = self.pipe.model.config
+                print(f"DEBUG: Model config class: {type(config)}")
+                print(f"DEBUG: Model config attributes: {list(config.__dict__.keys())}")
+                
+                # Check for depth-specific configuration
+                if hasattr(config, 'depth_scale'):
+                    print(f"DEBUG: Model depth_scale: {config.depth_scale}")
+                if hasattr(config, 'depth_shift'):
+                    print(f"DEBUG: Model depth_shift: {config.depth_shift}")
+                if hasattr(config, 'depth_min'):
+                    print(f"DEBUG: Model depth_min: {config.depth_min}")
+                if hasattr(config, 'depth_max'):
+                    print(f"DEBUG: Model depth_max: {config.depth_max}")
+            
+            # Check pipeline configuration
+            print(f"DEBUG: Pipeline task: {self.pipe.task}")
+            print(f"DEBUG: Pipeline framework: {self.pipe.framework}")
+            
+            # Initialize depth logger
+            if enable_depth_logging and ENABLE_DEPTH_LOGGING:
+                try:
+                    self.depth_logger = create_depth_logger(
+                        log_dir="logs",
+                        max_log_files=DEPTH_LOG_MAX_FILES,
+                        sample_strategy=DEPTH_LOG_SAMPLE_STRATEGY
+                    )
+                    print(f"✅ Depth logger initialized (strategy: {DEPTH_LOG_SAMPLE_STRATEGY})")
+                except Exception as logger_error:
+                    print(f"⚠️ Warning: Could not initialize depth logger: {logger_error}")
+                    self.depth_logger = None
+            else:
+                self.depth_logger = None
+                print("ℹ️ Depth logging disabled")
             
         except Exception as e:
             print(f"❌ Error loading depth pipeline: {e}")
@@ -191,10 +273,18 @@ class DepthEstimatorPipeline:
             print(f"DEBUG: Image size: {image.size}")
             
             # Get depth estimation
+            print(f"DEBUG: Calling pipeline with image type: {type(image)}")
+            print(f"DEBUG: Pipeline call parameters: task={self.pipe.task}")
+            
             result = self.pipe(image)
+            print(f"DEBUG: Pipeline result type: {type(result)}")
+            print(f"DEBUG: Pipeline result keys: {result.keys() if hasattr(result, 'keys') else 'Not a dict'}")
+            
             depth_map = result["depth"]
             
             print(f"DEBUG: Depth estimation result shape: {depth_map.size}")
+            print(f"DEBUG: Depth estimation result type: {type(depth_map)}")
+            print(f"DEBUG: Depth estimation result mode: {depth_map.mode if hasattr(depth_map, 'mode') else 'N/A'}")
             
             # Convert PIL image to numpy array
             depth_array = np.array(depth_map)
@@ -204,7 +294,74 @@ class DepthEstimatorPipeline:
             print(f"DEBUG: Raw depth array data type: {depth_array.dtype}")
             print(f"DEBUG: Raw depth unique values: {len(np.unique(depth_array))}")
             
-            # Return raw depth array without any preprocessing
+            # Sample some depth values for debugging
+            h, w = depth_array.shape
+            sample_points = [
+                (w//4, h//4),      # Top-left quadrant
+                (w//2, h//2),      # Center
+                (3*w//4, h//4),    # Top-right quadrant
+                (w//4, 3*h//4),    # Bottom-left quadrant
+                (3*w//4, 3*h//4)   # Bottom-right quadrant
+            ]
+            
+            print(f"DEBUG: Sample depth values:")
+            for i, (x, y) in enumerate(sample_points):
+                depth_val = depth_array[y, x]
+                print(f"  Point {i+1} ({x}, {y}): {depth_val}")
+            
+            # Check for quantization patterns
+            unique_vals = np.unique(depth_array)
+            if len(unique_vals) <= 256:
+                print(f"DEBUG: Quantization detected - only {len(unique_vals)} unique values")
+                print(f"DEBUG: First 10 unique values: {unique_vals[:10]}")
+                print(f"DEBUG: Last 10 unique values: {unique_vals[-10:]}")
+                
+                # Check if values are evenly spaced (suggesting 8-bit quantization)
+                if len(unique_vals) > 1:
+                    diffs = np.diff(unique_vals)
+                    unique_diffs = np.unique(diffs)
+                    print(f"DEBUG: Value differences - unique: {len(unique_diffs)}, range: [{unique_diffs.min()}, {unique_diffs.max()}]")
+                
+                # Convert 8-bit depth to more realistic depth range
+                print("DEBUG: Converting 8-bit depth to realistic depth range")
+                # Assume depth range of 0.1m to 10m (typical for welding scenarios)
+                depth_min_meters = 0.1
+                depth_max_meters = 10.0
+                
+                # Convert from 0-255 to depth_min_meters-depth_max_meters
+                depth_array = depth_array.astype(np.float32)
+                depth_array = depth_min_meters + (depth_array / 255.0) * (depth_max_meters - depth_min_meters)
+                
+                print(f"DEBUG: Converted depth range: {depth_array.min():.3f}m to {depth_array.max():.3f}m")
+                print(f"DEBUG: Sample converted depths:")
+                for i, (x, y) in enumerate(sample_points):
+                    depth_val = depth_array[y, x]
+                    print(f"  Point {i+1} ({x}, {y}): {depth_val:.3f}m")
+            
+            # Log depth data if logger is available
+            if hasattr(self, 'depth_logger') and self.depth_logger is not None:
+                try:
+                    print("DEBUG: Logging depth map data...")
+                    additional_metadata = {
+                        'model_name': getattr(self.pipe, 'model', 'unknown'),
+                        'device': getattr(self.pipe, 'device', 'unknown'),
+                        'pipeline_task': 'depth-estimation',
+                        'quantization_detected': len(unique_vals) <= 256 if 'unique_vals' in locals() else False,
+                        'conversion_applied': len(unique_vals) <= 256 if 'unique_vals' in locals() else False
+                    }
+                    
+                    log_file = self.depth_logger.log_depth_estimation(
+                        depth_array, 
+                        image_path, 
+                        self.pipe.model.name_or_path if hasattr(self.pipe, 'model') else 'unknown',
+                        additional_metadata
+                    )
+                    if log_file:
+                        print(f"DEBUG: Depth log saved to: {log_file}")
+                except Exception as logging_error:
+                    print(f"⚠️ Warning: Error logging depth map: {logging_error}")
+            
+            # Return processed depth array
             return depth_array
             
         except Exception as e:
@@ -236,7 +393,7 @@ class KeypointProcessor3D:
             
             # Initialize depth estimator
             print("Initializing depth estimator pipeline...")
-            self.depth_estimator = DepthEstimatorPipeline(depth_model_name)
+            self.depth_estimator = DepthEstimatorPipeline(depth_model_name, enable_depth_logging=ENABLE_DEPTH_LOGGING)
             print("✅ Depth estimator pipeline initialized")
             
             # Initialize surface normal estimator FIRST
@@ -247,7 +404,8 @@ class KeypointProcessor3D:
                 ox=CAMERA_CX,
                 oy=CAMERA_CY,
                 alpha=SURFACE_NORMAL_ALPHA,
-                r_threshold=SURFACE_NORMAL_R_THRESHOLD
+                r_threshold=SURFACE_NORMAL_R_THRESHOLD,
+                roi_alpha_method=ROI_ALPHA_METHOD
             )
             print("✅ Surface normal estimator initialized")
             
@@ -260,6 +418,44 @@ class KeypointProcessor3D:
             print("Initializing travel tracker...")
             self.travel_tracker = TravelTracker()
             print("✅ Travel tracker initialized")
+            
+            # Initialize contact plane data
+            self.contact_plane_data = None
+            print("✅ Contact plane data initialized")
+            
+            # Initialize VGGT camera pose extractor (Phase 2)
+            if VGGT_AVAILABLE and USE_VGGT_CAMERA_POSE:
+                print("Initializing VGGT camera pose extractor...")
+                try:
+                    self.camera_pose_extractor = CameraPoseExtractor()
+                    print("✅ VGGT camera pose extractor initialized")
+                except Exception as vggt_error:
+                    print(f"⚠️ VGGT initialization failed: {vggt_error}")
+                    print("   Falling back to default camera parameters")
+                    self.camera_pose_extractor = None
+            else:
+                self.camera_pose_extractor = None
+                if not VGGT_AVAILABLE:
+                    print("📐 VGGT not available - using default camera parameters")
+                else:
+                    print("📐 VGGT disabled in configuration - using default camera parameters")
+            
+            # Initialize metadata extractor for intrinsics
+            if VGGT_AVAILABLE and EXTRACT_CAMERA_METADATA:
+                print("Initializing camera metadata extractor...")
+                try:
+                    self.metadata_extractor = CameraMetadataExtractor()
+                    print("✅ Camera metadata extractor initialized")
+                except Exception as metadata_error:
+                    print(f"⚠️ Metadata extractor initialization failed: {metadata_error}")
+                    self.metadata_extractor = None
+            else:
+                self.metadata_extractor = None
+            
+            # Cache for extracted camera parameters (for fixed camera scenarios)
+            self.cached_camera_intrinsics = None
+            self.cached_camera_extrinsics = None
+            self.cached_source_image = None
                 
         except Exception as e:
             print(f"❌ Error in KeypointProcessor3D.__init__: {e}")
@@ -277,37 +473,41 @@ class KeypointProcessor3D:
         x = max(0, min(w - 1, int(x)))
         y = max(0, min(h - 1, int(y)))
         
-        # Get depth value (normalized 0-255)
+        # Get depth value (already in meters from depth estimation)
         depth_value = depth_map[y, x]
         
         print(f"DEBUG: Depth map shape: {depth_map.shape}")
         print(f"DEBUG: Requested coordinates: ({x}, {y})")
         print(f"DEBUG: Raw depth value: {depth_value}")
         
-        # Convert to real-world depth (adjust scale factor as needed)
-        real_depth = depth_value / DEPTH_SCALE_FACTOR
+        # The depth value is already in meters, no conversion needed
+        print(f"DEBUG: Depth in meters: {depth_value}")
         
-        print(f"DEBUG: Real depth (after scaling): {real_depth}")
-        
-        return real_depth
+        return depth_value
     
-    def pixel_to_3d_coordinates(self, pixel_x, pixel_y, depth_value):
-        """Convert 2D pixel coordinates + depth to 3D world coordinates"""
+    def pixel_to_3d_coordinates(self, pixel_x, pixel_y, depth_value, fx=None, fy=None, cx=None, cy=None):
+        """Convert 2D pixel coordinates + depth to 3D world coordinates using VGGT-extracted camera parameters"""
         print(f"\n=== DEBUG: 3D Coordinate Conversion ===")
         print(f"Input: pixel_x={pixel_x}, pixel_y={pixel_y}, depth_value={depth_value}")
-        print(f"Camera params: fx={CAMERA_FX}, fy={CAMERA_FY}, cx={CAMERA_CX}, cy={CAMERA_CY}")
+        
+        # Use provided camera parameters or fall back to cached/default values
+        if fx is None or fy is None or cx is None or cy is None:
+            if self.cached_camera_intrinsics is not None:
+                fx, fy, cx, cy = self.cached_camera_intrinsics
+                print(f"Using cached camera params: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
+            else:
+                fx, fy, cx, cy = CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY
+                print(f"Using default camera params: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
+        else:
+            print(f"Using provided camera params: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
         
         if depth_value is None:
             print(f"DEBUG: Depth value is None, returning None coordinates")
             return None, None, None
         
-        # The depth_value is already in the range 0-255 (normalized)
-        # We need to convert this to real-world meters
-        # For Depth Anything models, we need to scale this properly
-        
-        # Convert normalized depth (0-255) to meters
-        # This is the key fix - we need to scale the depth properly
-        depth_meters = depth_value * DEPTH_SCALE_METERS + DEPTH_OFFSET
+        # The depth_value is already converted to meters in the estimate_depth function
+        # No additional scaling needed here - the depth is already in the correct range
+        depth_meters = depth_value
         
         print(f"DEBUG: Depth in meters: {depth_meters}")
         
@@ -315,13 +515,89 @@ class KeypointProcessor3D:
         # Z = depth_meters
         # X = (u - cx) * Z / fx
         # Y = (v - cy) * Z / fy
-        x_3d = (pixel_x - CAMERA_CX) * depth_meters / CAMERA_FX
-        y_3d = (pixel_y - CAMERA_CY) * depth_meters / CAMERA_FY
+        x_3d = (pixel_x - cx) * depth_meters / fx
+        y_3d = (pixel_y - cy) * depth_meters / fy
         z_3d = depth_meters
         
         print(f"DEBUG: 3D coordinates: x={x_3d}, y={y_3d}, z={z_3d}")
         
         return x_3d, y_3d, z_3d
+    
+    def extract_camera_parameters_vggt(self, image_path):
+        """
+        Extract camera intrinsics and extrinsics using VGGT (Phase 2).
+        
+        Args:
+            image_path (str): Path to the image for camera parameter extraction
+            
+        Returns:
+            tuple: (fx, fy, cx, cy, extrinsic_matrix) or (None, None, None, None, None) if failed
+        """
+        print(f"\n=== VGGT Camera Parameter Extraction ===")
+        print(f"Image path: {image_path}")
+        
+        if not VGGT_AVAILABLE or not USE_VGGT_CAMERA_POSE or self.camera_pose_extractor is None:
+            print("DEBUG: VGGT not available or disabled, using default parameters")
+            return CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY, None
+        
+        try:
+            # Check cache for fixed camera scenarios
+            if (self.cached_camera_intrinsics is not None and 
+                self.cached_camera_extrinsics is not None and
+                self.cached_source_image is not None):
+                print(f"DEBUG: Using cached camera parameters from: {self.cached_source_image}")
+                fx, fy, cx, cy = self.cached_camera_intrinsics
+                return fx, fy, cx, cy, self.cached_camera_extrinsics
+            
+            # Extract metadata intrinsics if available
+            metadata_intrinsics = None
+            if self.metadata_extractor is not None:
+                print("🔍 Extracting camera intrinsics from image metadata...")
+                metadata_intrinsics_obj = self.metadata_extractor.extract_from_image(image_path)
+                
+                if metadata_intrinsics_obj and metadata_intrinsics_obj.fx > 0:
+                    metadata_intrinsics = {
+                        'fx': metadata_intrinsics_obj.fx,
+                        'fy': metadata_intrinsics_obj.fy,
+                        'cx': metadata_intrinsics_obj.cx,
+                        'cy': metadata_intrinsics_obj.cy
+                    }
+                    print(f"✅ Extracted metadata intrinsics: fx={metadata_intrinsics_obj.fx:.1f}, fy={metadata_intrinsics_obj.fy:.1f}")
+                    print(f"   Source: {metadata_intrinsics_obj.source}, Camera: {metadata_intrinsics_obj.camera_model}")
+            
+            # Get intrinsics with VGGT fallback
+            print("🎯 Getting camera intrinsics with VGGT fallback...")
+            fx, fy, cx, cy = self.camera_pose_extractor.get_intrinsics_with_fallback(
+                image_path, metadata_intrinsics
+            )
+            
+            # Get extrinsics with gravity prior
+            print("🌍 Extracting camera extrinsics with gravity prior...")
+            if USE_GRAVITY_PRIOR:
+                extrinsic_matrix, _ = self.camera_pose_extractor.extract_or_get_cached_pose_with_gravity_prior(
+                    image_path, FORWARD_PITCH_DEGREES
+                )
+                print(f"✅ Applied gravity prior with {FORWARD_PITCH_DEGREES}° forward pitch")
+            else:
+                extrinsic_matrix, _ = self.camera_pose_extractor.extract_or_get_cached_pose(image_path)
+                print("✅ Extracted camera extrinsics without gravity prior")
+            
+            # Cache the results for fixed camera scenarios
+            self.cached_camera_intrinsics = (fx, fy, cx, cy)
+            self.cached_camera_extrinsics = extrinsic_matrix
+            self.cached_source_image = image_path
+            
+            print(f"✅ Camera parameters extracted successfully:")
+            print(f"   Intrinsics: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+            print(f"   Extrinsics shape: {extrinsic_matrix.shape}")
+            print(f"   Parameters cached for subsequent frames")
+            
+            return fx, fy, cx, cy, extrinsic_matrix
+            
+        except Exception as e:
+            print(f"❌ VGGT camera parameter extraction failed: {e}")
+            print("   Falling back to default camera parameters")
+            return CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY, None
     
     def combine_2d_and_depth(self, keypoints_2d, depth_map, img_width, img_height, parent_object=None):
         """Combine 2D keypoints with depth information to get 3D coordinates"""
@@ -454,6 +730,116 @@ class KeypointProcessor3D:
             print(f"ERROR: Missing electrode keypoints. Body: {electrode_body is not None}, Tip: {electrode_tip is not None}")
         
         return electrode_data
+    
+    def estimate_contact_plane_normal(self, depth_map, img_width, img_height, keypoints_3d, image_path=None):
+        """
+        Estimate the local plane normal at the anticipated contact region using VGGT-extracted camera parameters.
+        
+        Args:
+            depth_map (np.ndarray): Depth map (HxW)
+            img_width (int): Image width
+            img_height (int): Image height
+            keypoints_3d (list): List of 3D keypoints
+            image_path (str, optional): Path to image for VGGT camera parameter extraction
+        """
+        print(f"\n=== DEBUG: Estimating Contact Plane Normal (Phase 2 with VGGT) ===")
+        print(f"DEBUG: Input parameters - depth_map shape: {depth_map.shape if depth_map is not None else 'None'}, img_size: {img_width}x{img_height}, keypoints: {len(keypoints_3d)}")
+        print(f"DEBUG: Image path for VGGT: {image_path}")
+        
+        try:
+            # Extract camera parameters using VGGT (Phase 2)
+            if image_path is not None:
+                fx, fy, cx, cy, extrinsic_matrix = self.extract_camera_parameters_vggt(image_path)
+                print(f"DEBUG: Using VGGT-extracted camera parameters: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+                if extrinsic_matrix is not None:
+                    print(f"DEBUG: Extrinsic matrix shape: {extrinsic_matrix.shape}")
+            else:
+                # Use cached or default parameters
+                if self.cached_camera_intrinsics is not None:
+                    fx, fy, cx, cy = self.cached_camera_intrinsics
+                    extrinsic_matrix = self.cached_camera_extrinsics
+                    print(f"DEBUG: Using cached camera parameters: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+                else:
+                    fx, fy, cx, cy = CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY
+                    extrinsic_matrix = None
+                    print(f"DEBUG: Using default camera parameters: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+            
+            # Find electrode keypoints
+            electrode_tip_3d = None
+            electrode_body_3d = None
+            
+            print(f"DEBUG: Searching for electrode keypoints in {len(keypoints_3d)} keypoints")
+            for i, keypoint in enumerate(keypoints_3d):
+                parent_object = keypoint.get('parent_object')
+                keypoint_class = keypoint.get('class')
+                print(f"DEBUG: Keypoint {i}: parent_object='{parent_object}', class='{keypoint_class}'")
+                
+                if parent_object == 'electrode':
+                    if keypoint_class == 'tip':
+                        electrode_tip_3d = np.array([keypoint['x_3d'], keypoint['y_3d'], keypoint['z_3d']])
+                        print(f"DEBUG: Found electrode tip: {electrode_tip_3d}")
+                    elif keypoint_class == 'body':
+                        electrode_body_3d = np.array([keypoint['x_3d'], keypoint['y_3d'], keypoint['z_3d']])
+                        print(f"DEBUG: Found electrode body: {electrode_body_3d}")
+            
+            if electrode_tip_3d is None or electrode_body_3d is None:
+                print(f"DEBUG: Missing electrode keypoints - tip: {electrode_tip_3d is not None}, body: {electrode_body_3d is not None}")
+                return None
+            
+            # Calculate electrode axis vector (from body to tip)
+            electrode_axis = electrode_tip_3d - electrode_body_3d
+            electrode_axis_norm = np.linalg.norm(electrode_axis)
+            if electrode_axis_norm == 0:
+                print("ERROR: Invalid electrode axis vector")
+                return None
+            
+            electrode_axis = electrode_axis / electrode_axis_norm
+            print(f"DEBUG: Electrode axis vector: {electrode_axis}")
+            
+            # Prepare camera intrinsics using VGGT-extracted parameters
+            camera_intrinsics = {
+                'fx': fx,
+                'fy': fy,
+                'cx': cx,
+                'cy': cy
+            }
+            
+            # Store camera parameters for surface normal estimator
+            if extrinsic_matrix is not None:
+                self.surface_normal_estimator.fx = fx
+                self.surface_normal_estimator.fy = fy
+                self.surface_normal_estimator.ox = cx
+                self.surface_normal_estimator.oy = cy
+                print("✅ Updated surface normal estimator with VGGT camera parameters")
+            
+            # Estimate contact plane normal using WorkpieceDetector
+            contact_plane_data = self.workpiece_detector.estimate_contact_plane_normal(
+                electrode_tip_3d, 
+                electrode_axis, 
+                depth_map, 
+                camera_intrinsics,
+                roi_radius_pixels=50  # Configurable ROI radius
+            )
+            
+            if contact_plane_data:
+                print(f"✅ Contact plane normal estimated successfully with VGGT parameters")
+                print(f"Contact normal: {contact_plane_data['normal']}")
+                print(f"Contact point: {contact_plane_data['contact_point']}")
+                print(f"Confidence: {contact_plane_data['confidence']:.3f}")
+                
+                # Store contact plane data for visualization
+                self.contact_plane_data = contact_plane_data
+                
+                return contact_plane_data
+            else:
+                print("DEBUG: Failed to estimate contact plane normal")
+                return None
+                
+        except Exception as e:
+            print(f"ERROR in contact plane estimation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def calculate_filler_rod_geometry(self, keypoints_3d):
         """Calculate filler rod geometry from 3D keypoints"""
@@ -709,6 +1095,8 @@ class KeypointProcessor3D:
     
     def draw_keypoints_3d(self, frame, predictions, depth_map=None):
         """Draw 3D keypoints and connections on the frame"""
+        print(f"DEBUG: draw_keypoints_3d called with {len(predictions) if predictions else 0} predictions")
+        
         if not predictions:
             print("No predictions to draw")
             return frame
@@ -716,6 +1104,9 @@ class KeypointProcessor3D:
         img_height, img_width = frame.shape[:2]
         print(f"Drawing 3D keypoints on frame size: {img_width}x{img_height}")
         print(f"Processing {len(predictions)} predictions")
+        print(f"DEBUG: Depth map available: {depth_map is not None}")
+        if depth_map is not None:
+            print(f"DEBUG: Depth map shape: {depth_map.shape}")
         
         # Store current depth map for coordinate axes
         if depth_map is not None:
@@ -723,19 +1114,45 @@ class KeypointProcessor3D:
             
             # Collect all keypoints for workpiece detection
             all_keypoints_3d = []
-            for prediction in predictions:
+            print(f"DEBUG: Collecting keypoints from {len(predictions)} predictions")
+            for i, prediction in enumerate(predictions):
                 keypoints = prediction.get('keypoints', [])
-                for keypoint in keypoints:
+                print(f"DEBUG: Prediction {i} has {len(keypoints)} keypoints")
+                for j, keypoint in enumerate(keypoints):
                     if 'x_3d' in keypoint and 'y_3d' in keypoint and 'z_3d' in keypoint:
                         all_keypoints_3d.append(keypoint)
+                        print(f"DEBUG: Added keypoint {j}: parent_object={keypoint.get('parent_object')}, class={keypoint.get('class')}")
+                    else:
+                        print(f"DEBUG: Skipped keypoint {j} - missing 3D coordinates")
+            
+            print(f"DEBUG: Collected {len(all_keypoints_3d)} 3D keypoints total")
+            
+            # Check for electrode keypoints specifically
+            electrode_keypoints = [kp for kp in all_keypoints_3d if kp.get('parent_object') == 'electrode']
+            print(f"DEBUG: Found {len(electrode_keypoints)} electrode keypoints")
+            for i, kp in enumerate(electrode_keypoints):
+                print(f"DEBUG: Electrode keypoint {i}: class={kp.get('class')}, 3D=({kp.get('x_3d')}, {kp.get('y_3d')}, {kp.get('z_3d')})")
             
             self.workpiece_detector.detect_workpiece_surface(depth_map, img_width, img_height, all_keypoints_3d)
+            
+            # Estimate contact plane normal if we have electrode keypoints
+            print(f"DEBUG: About to estimate contact plane normal with {len(all_keypoints_3d)} keypoints")
+            contact_result = self.estimate_contact_plane_normal(depth_map, img_width, img_height, all_keypoints_3d)
+            if contact_result:
+                print(f"DEBUG: Contact plane estimation successful!")
+            else:
+                print(f"DEBUG: Contact plane estimation failed or returned None")
+        else:
+            print(f"DEBUG: No depth map available, skipping contact plane estimation")
         
         # Draw coordinate axes based on surface normal estimation
         self.draw_coordinate_axes(frame, img_width, img_height)
         
         # Draw workpiece surface indicator
         self.draw_workpiece_surface_indicator(frame, img_width, img_height)
+        
+        # Draw contact plane visualization
+        self.draw_contact_plane_visualization(frame, img_width, img_height)
         
         # Collect all keypoints for processing
         all_keypoints_3d = []
@@ -996,8 +1413,17 @@ class KeypointProcessor3D:
             return
         
         try:
+            # Get ROI coordinates if available
+            roi_coordinates = None
+            if hasattr(self, 'workpiece_detector') and self.workpiece_detector is not None:
+                roi_coordinates = self.workpiece_detector.get_manual_roi()
+                if roi_coordinates:
+                    print(f"DEBUG: Using ROI coordinates for surface normal alpha: {roi_coordinates}")
+                else:
+                    print("DEBUG: No manual ROI available, using default alpha")
+            
             # Estimate surface normals from depth map
-            normals = self.surface_normal_estimator.estimate_normals(depth_map)
+            normals = self.surface_normal_estimator.estimate_normals(depth_map, roi_coordinates=roi_coordinates)
             
             # Get center pixel coordinates
             center_x = img_width // 2
@@ -1046,7 +1472,7 @@ class KeypointProcessor3D:
             tangent2 = tangent2 / np.linalg.norm(tangent2)
             
             # Scale factor for visualization
-            axis_length_3d = 0.2  # 20cm in 3D space (increased for better visibility)
+            axis_length_3d = 0.5  # 50cm in 3D space (increased for better visibility)
             
             # Project 3D axes back to 2D for visualization
             def project_3d_to_2d(point_3d):
@@ -1057,36 +1483,57 @@ class KeypointProcessor3D:
                 y = int(CAMERA_CY + point_3d[1] * CAMERA_FY / point_3d[2])
                 return (x, y)
             
-            # Draw the three axes
+            # Check if all three axes are valid before drawing any of them
             # Z-axis (normal vector) - Blue
             normal_end_3d = np.array([center_3d_x, center_3d_y, center_3d_z]) + center_normal * axis_length_3d
             normal_end_2d = project_3d_to_2d(normal_end_3d)
-            
-            if normal_end_2d and normal_end_2d != (center_x, center_y):
-                # Check if projection is within bounds
-                if 0 <= normal_end_2d[0] < img_width and 0 <= normal_end_2d[1] < img_height:
-                    cv2.arrowedLine(frame, (center_x, center_y), normal_end_2d, (255, 0, 0), 3, tipLength=0.3)
-                    cv2.putText(frame, "N", normal_end_2d, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
             
             # X-axis (first tangent) - Red
             tangent1_end_3d = np.array([center_3d_x, center_3d_y, center_3d_z]) + tangent1 * axis_length_3d
             tangent1_end_2d = project_3d_to_2d(tangent1_end_3d)
             
-            if tangent1_end_2d and tangent1_end_2d != (center_x, center_y):
-                # Check if projection is within bounds
-                if 0 <= tangent1_end_2d[0] < img_width and 0 <= tangent1_end_2d[1] < img_height:
-                    cv2.arrowedLine(frame, (center_x, center_y), tangent1_end_2d, (0, 0, 255), 3, tipLength=0.3)
-                    cv2.putText(frame, "T1", tangent1_end_2d, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            
             # Y-axis (second tangent) - Green
             tangent2_end_3d = np.array([center_3d_x, center_3d_y, center_3d_z]) + tangent2 * axis_length_3d
             tangent2_end_2d = project_3d_to_2d(tangent2_end_3d)
             
-            if tangent2_end_2d and tangent2_end_2d != (center_x, center_y):
-                # Check if projection is within bounds
-                if 0 <= tangent2_end_2d[0] < img_width and 0 <= tangent2_end_2d[1] < img_height:
-                    cv2.arrowedLine(frame, (center_x, center_y), tangent2_end_2d, (0, 255, 0), 3, tipLength=0.3)
-                    cv2.putText(frame, "T2", tangent2_end_2d, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # Check if all three axes are valid and within bounds
+            axes_valid = []
+            
+            # Check normal axis (Z)
+            if (normal_end_2d and normal_end_2d != (center_x, center_y) and
+                0 <= normal_end_2d[0] < img_width and 0 <= normal_end_2d[1] < img_height):
+                axes_valid.append(("normal", normal_end_2d))
+            
+            # Check tangent1 axis (X)
+            if (tangent1_end_2d and tangent1_end_2d != (center_x, center_y) and
+                0 <= tangent1_end_2d[0] < img_width and 0 <= tangent1_end_2d[1] < img_height):
+                axes_valid.append(("tangent1", tangent1_end_2d))
+            
+            # Check tangent2 axis (Y)
+            if (tangent2_end_2d and tangent2_end_2d != (center_x, center_y) and
+                0 <= tangent2_end_2d[0] < img_width and 0 <= tangent2_end_2d[1] < img_height):
+                axes_valid.append(("tangent2", tangent2_end_2d))
+            
+            # Only draw all axes if all three are valid
+            if len(axes_valid) == 3:
+                print(f"DEBUG: All three coordinate axes are valid - drawing complete coordinate system")
+                
+                # Draw Z-axis (normal vector) - Blue
+                cv2.arrowedLine(frame, (center_x, center_y), axes_valid[0][1], (255, 0, 0), 3, tipLength=0.3)
+                cv2.putText(frame, "N", axes_valid[0][1], cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+                
+                # Draw X-axis (first tangent) - Red
+                cv2.arrowedLine(frame, (center_x, center_y), axes_valid[1][1], (0, 0, 255), 3, tipLength=0.3)
+                cv2.putText(frame, "T1", axes_valid[1][1], cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                
+                # Draw Y-axis (second tangent) - Green
+                cv2.arrowedLine(frame, (center_x, center_y), axes_valid[2][1], (0, 255, 0), 3, tipLength=0.3)
+                cv2.putText(frame, "T2", axes_valid[2][1], cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                
+            else:
+                print(f"DEBUG: Only {len(axes_valid)} out of 3 coordinate axes are valid - not drawing any axes")
+                print(f"DEBUG: Valid axes: {[axis[0] for axis in axes_valid]}")
+                return
             
             # Draw center point
             cv2.circle(frame, (center_x, center_y), 5, (255, 255, 255), -1)
@@ -1105,20 +1552,22 @@ class KeypointProcessor3D:
         if workpiece_normal is None:
             return
         
-        # Draw workpiece mask overlay if available
+        # Draw workpiece bounding box if available
         if workpiece_mask is not None:
-            # Create a colored overlay for the workpiece mask
-            mask_overlay = np.zeros_like(frame)
-            mask_overlay[workpiece_mask > 0] = [0, 255, 0]  # Green for workpiece area
-            
-            # Blend the mask overlay with the frame (30% opacity)
-            frame = cv2.addWeighted(frame, 0.7, mask_overlay, 0.3, 0)
-            
-            # Add a label for the workpiece area
-            cv2.putText(frame, "Workpiece Area", (10, img_height - 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # Find the bounding box of the workpiece mask
+            mask_indices = np.where(workpiece_mask > 0)
+            if len(mask_indices[0]) > 0:
+                y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
+                x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
+                
+                # Draw bounding box
+                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                
+                # Add a label for the workpiece area
+                cv2.putText(frame, "Workpiece Area", (x_min, y_min - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
-        print("DEBUG: Drew workpiece surface indicator with mask overlay")
+        print("DEBUG: Drew workpiece surface indicator with bounding box")
     
     def _draw_surface_normal(self, frame, center_x, center_y, normal):
         """Draw the surface normal vector as an arrow"""
@@ -1155,6 +1604,72 @@ class KeypointProcessor3D:
                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
         
         print(f"DEBUG: Drew surface normal: {normal}")
+    
+    def draw_contact_plane_visualization(self, frame, img_width, img_height):
+        """Draw visualization of the contact plane normal and region"""
+        print(f"DEBUG: draw_contact_plane_visualization called")
+        if not hasattr(self, 'contact_plane_data'):
+            print(f"DEBUG: No contact_plane_data attribute found")
+            return
+        if self.contact_plane_data is None:
+            print(f"DEBUG: contact_plane_data is None")
+            return
+        print(f"DEBUG: Drawing contact plane visualization with data: {self.contact_plane_data}")
+        
+        try:
+            contact_data = self.contact_plane_data
+            roi = contact_data.get('roi')
+            contact_point = contact_data.get('contact_point')
+            normal = contact_data.get('normal')
+            confidence = contact_data.get('confidence', 0.0)
+            
+            if roi is None or contact_point is None or normal is None:
+                return
+            
+            # Draw contact region ROI
+            roi_x1, roi_y1, roi_x2, roi_y2 = roi
+            cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 2)  # Yellow rectangle
+            
+            # Project contact point to 2D for visualization
+            fx, fy, cx, cy = CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY
+            if contact_point[2] > 0:
+                contact_x_2d = int((contact_point[0] * fx / contact_point[2]) + cx)
+                contact_y_2d = int((contact_point[1] * fy / contact_point[2]) + cy)
+                
+                # Draw contact point
+                cv2.circle(frame, (contact_x_2d, contact_y_2d), 8, (0, 255, 0), -1)  # Green circle
+                cv2.circle(frame, (contact_x_2d, contact_y_2d), 10, (0, 0, 0), 2)   # Black border
+                
+                # Draw contact plane normal vector
+                normal_scale = 50  # Scale factor for normal vector visualization
+                normal_end_x = int(contact_x_2d + normal[0] * normal_scale)
+                normal_end_y = int(contact_y_2d + normal[1] * normal_scale)
+                
+                # Draw normal vector arrow
+                cv2.arrowedLine(frame, (contact_x_2d, contact_y_2d), (normal_end_x, normal_end_y),
+                              (255, 0, 255), 3, tipLength=0.3)  # Magenta arrow
+                
+                # Add labels
+                cv2.putText(frame, "Contact", (contact_x_2d + 15, contact_y_2d - 10),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(frame, "Normal", (normal_end_x + 5, normal_end_y),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                
+                # Add confidence and normal values
+                confidence_text = f"Conf: {confidence:.2f}"
+                normal_text = f"[{normal[0]:.2f}, {normal[1]:.2f}, {normal[2]:.2f}]"
+                
+                # Position text above the contact point
+                text_y = max(20, contact_y_2d - 40)
+                cv2.putText(frame, confidence_text, (contact_x_2d - 50, text_y),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, normal_text, (contact_x_2d - 50, text_y + 20),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                print(f"DEBUG: Drew contact plane visualization - ROI: {roi}, Contact: ({contact_x_2d}, {contact_y_2d}), Normal: {normal}")
+            
+        except Exception as e:
+            print(f"DEBUG: Error drawing contact plane visualization: {e}")
     
     def draw_velocity_arrow(self, frame, keypoints_3d):
         """Draw velocity arrow from electrode tip"""
@@ -1253,9 +1768,17 @@ class KeypointProcessor3D:
         if depth_map is None:
             return None
         
-        # Normalize depth map to 0-255 range for visualization
-        depth_normalized = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
-        depth_normalized = depth_normalized.astype(np.uint8)
+        # For visualization, normalize depth map to 0-255 range
+        # Since depth values are now in meters (0.1-10m), we need to scale appropriately
+        depth_min = depth_map.min()
+        depth_max = depth_map.max()
+        
+        if depth_max > depth_min:
+            # Normalize to 0-255 range for visualization
+            depth_normalized = ((depth_map - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+        else:
+            # If all values are the same, use a default range
+            depth_normalized = np.full_like(depth_map, 128, dtype=np.uint8)
         
         # Apply color map to normalized depth map
         depth_colored = cv2.applyColorMap(depth_normalized, DEPTH_COLOR_MAP)
@@ -1267,18 +1790,20 @@ class KeypointProcessor3D:
         # Get workpiece mask if available
         workpiece_mask = self.workpiece_detector.get_workpiece_mask()
         
-        # Add workpiece mask overlay if available
+        # Add workpiece bounding box if available
         if workpiece_mask is not None:
-            # Create a colored overlay for the workpiece mask
-            mask_overlay = np.zeros_like(depth_colored)
-            mask_overlay[workpiece_mask > 0] = [0, 255, 0]  # Green for workpiece area
-            
-            # Blend the mask overlay with the depth map (25% opacity)
-            depth_colored = cv2.addWeighted(depth_colored, 0.75, mask_overlay, 0.25, 0)
-            
-            # Add a label for the workpiece area
-            cv2.putText(depth_colored, "Workpiece Area", (10, h - 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # Find the bounding box of the workpiece mask
+            mask_indices = np.where(workpiece_mask > 0)
+            if len(mask_indices[0]) > 0:
+                y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
+                x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
+                
+                # Draw bounding box
+                cv2.rectangle(depth_colored, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                
+                # Add a label for the workpiece area
+                cv2.putText(depth_colored, "Workpiece Area", (x_min, y_min - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
         # Add surface normal estimation if enabled
         if ENABLE_SURFACE_NORMALS:
@@ -1286,10 +1811,45 @@ class KeypointProcessor3D:
                 # Estimate surface normals from depth map (with mask if available)
                 if workpiece_mask is not None:
                     print("DEBUG: Using workpiece mask for surface normal estimation in depth visualization")
-                    normals = self.surface_normal_estimator.estimate_normals(depth_map, mask=workpiece_mask)
+                    # Debug depth values in masked region
+                    masked_depth = depth_map[workpiece_mask > 0]
+                    if len(masked_depth) > 0:
+                        print(f"DEBUG: Masked depth stats - min: {masked_depth.min():.3f}, max: {masked_depth.max():.3f}, mean: {masked_depth.mean():.3f}")
+                        print(f"DEBUG: Masked depth unique values: {len(np.unique(masked_depth))}")
+                        
+                        # Sample some depth values from masked region
+                        sample_indices = np.random.choice(len(masked_depth), min(10, len(masked_depth)), replace=False)
+                        sample_depths = masked_depth[sample_indices]
+                        print(f"DEBUG: Sample masked depth values: {sample_depths[:5]}")
+                        
+                        # Check for depth gradients in masked region
+                        if len(masked_depth) > 1:
+                            depth_diffs = np.diff(np.sort(masked_depth))
+                            unique_diffs = np.unique(depth_diffs)
+                            print(f"DEBUG: Masked depth differences - unique: {len(unique_diffs)}, min: {unique_diffs.min():.6f}, max: {unique_diffs.max():.6f}")
+                    
+                    # Get ROI coordinates if available
+                    roi_coordinates = None
+                    if hasattr(self, 'workpiece_detector') and self.workpiece_detector is not None:
+                        roi_coordinates = self.workpiece_detector.get_manual_roi()
+                        if roi_coordinates:
+                            print(f"DEBUG: Using ROI coordinates for surface normal alpha: {roi_coordinates}")
+                    
+                    normals = self.surface_normal_estimator.estimate_normals(depth_map, mask=workpiece_mask, roi_coordinates=roi_coordinates)
                 else:
                     print("DEBUG: No workpiece mask available, using full depth map for surface normal estimation")
-                    normals = self.surface_normal_estimator.estimate_normals(depth_map)
+                    # Debug full depth map
+                    print(f"DEBUG: Full depth map stats - min: {depth_map.min():.3f}, max: {depth_map.max():.3f}, mean: {depth_map.mean():.3f}")
+                    print(f"DEBUG: Full depth map unique values: {len(np.unique(depth_map))}")
+                    
+                    # Get ROI coordinates if available
+                    roi_coordinates = None
+                    if hasattr(self, 'workpiece_detector') and self.workpiece_detector is not None:
+                        roi_coordinates = self.workpiece_detector.get_manual_roi()
+                        if roi_coordinates:
+                            print(f"DEBUG: Using ROI coordinates for surface normal alpha: {roi_coordinates}")
+                    
+                    normals = self.surface_normal_estimator.estimate_normals(depth_map, roi_coordinates=roi_coordinates)
                 
                 # Create normal visualization
                 normal_vis = self.surface_normal_estimator.create_visualization(normals, (w, h))
@@ -1355,13 +1915,20 @@ class KeypointProcessor3D:
             # Get workpiece mask if available
             workpiece_mask = self.workpiece_detector.get_workpiece_mask()
             
+            # Get ROI coordinates if available
+            roi_coordinates = None
+            if hasattr(self, 'workpiece_detector') and self.workpiece_detector is not None:
+                roi_coordinates = self.workpiece_detector.get_manual_roi()
+                if roi_coordinates:
+                    print(f"DEBUG: Using ROI coordinates for surface normal alpha: {roi_coordinates}")
+            
             # Estimate surface normals from depth map (with mask if available)
             if workpiece_mask is not None:
                 print("DEBUG: Using workpiece mask for surface normal estimation")
-                normals = self.surface_normal_estimator.estimate_normals(depth_map, mask=workpiece_mask)
+                normals = self.surface_normal_estimator.estimate_normals(depth_map, mask=workpiece_mask, roi_coordinates=roi_coordinates)
             else:
                 print("DEBUG: No workpiece mask available, using full depth map")
-                normals = self.surface_normal_estimator.estimate_normals(depth_map)
+                normals = self.surface_normal_estimator.estimate_normals(depth_map, roi_coordinates=roi_coordinates)
             
             # Get frame dimensions
             h, w = original_frame.shape[:2]
@@ -1374,18 +1941,20 @@ class KeypointProcessor3D:
             magnitude_colored = cv2.applyColorMap(magnitude_map, SURFACE_NORMAL_COLOR_MAP)
             magnitude_colored = cv2.resize(magnitude_colored, (w, h))
             
-            # Add workpiece mask overlay if available
+            # Add workpiece bounding box if available
             if workpiece_mask is not None:
-                # Create a colored overlay for the workpiece mask
-                mask_overlay = np.zeros_like(magnitude_colored)
-                mask_overlay[workpiece_mask > 0] = [0, 255, 0]  # Green for workpiece area
-                
-                # Blend the mask overlay with the magnitude map (20% opacity)
-                magnitude_colored = cv2.addWeighted(magnitude_colored, 0.8, mask_overlay, 0.2, 0)
-                
-                # Add a label for the workpiece area
-                cv2.putText(magnitude_colored, "Workpiece Area", (10, h - 20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                # Find the bounding box of the workpiece mask
+                mask_indices = np.where(workpiece_mask > 0)
+                if len(mask_indices[0]) > 0:
+                    y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
+                    x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
+                    
+                    # Draw bounding box
+                    cv2.rectangle(magnitude_colored, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                    
+                    # Add a label for the workpiece area
+                    cv2.putText(magnitude_colored, "Workpiece Area", (x_min, y_min - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
             # Get normal statistics
             stats = self.surface_normal_estimator.get_normal_statistics(normals)
@@ -1418,13 +1987,20 @@ class KeypointProcessor3D:
             # Get workpiece mask if available
             workpiece_mask = self.workpiece_detector.get_workpiece_mask()
             
+            # Get ROI coordinates if available
+            roi_coordinates = None
+            if hasattr(self, 'workpiece_detector') and self.workpiece_detector is not None:
+                roi_coordinates = self.workpiece_detector.get_manual_roi()
+                if roi_coordinates:
+                    print(f"DEBUG: Using ROI coordinates for surface normal alpha: {roi_coordinates}")
+            
             # Estimate surface normals from depth map (with mask if available)
             if workpiece_mask is not None:
                 print("DEBUG: Using workpiece mask for surface normal estimation")
-                normals = self.surface_normal_estimator.estimate_normals(depth_map, mask=workpiece_mask)
+                normals = self.surface_normal_estimator.estimate_normals(depth_map, mask=workpiece_mask, roi_coordinates=roi_coordinates)
             else:
                 print("DEBUG: No workpiece mask available, using full depth map")
-                normals = self.surface_normal_estimator.estimate_normals(depth_map)
+                normals = self.surface_normal_estimator.estimate_normals(depth_map, roi_coordinates=roi_coordinates)
             
             # Get frame dimensions
             h, w = original_frame.shape[:2]
@@ -1441,18 +2017,20 @@ class KeypointProcessor3D:
             # Combine depth and normal visualizations
             combined_vis = cv2.addWeighted(depth_colored, 0.6, magnitude_colored, 0.4, 0)
             
-            # Add workpiece mask overlay if available
+            # Add workpiece bounding box if available
             if workpiece_mask is not None:
-                # Create a colored overlay for the workpiece mask
-                mask_overlay = np.zeros_like(combined_vis)
-                mask_overlay[workpiece_mask > 0] = [0, 255, 0]  # Green for workpiece area
-                
-                # Blend the mask overlay with the combined visualization (15% opacity)
-                combined_vis = cv2.addWeighted(combined_vis, 0.85, mask_overlay, 0.15, 0)
-                
-                # Add a label for the workpiece area
-                cv2.putText(combined_vis, "Workpiece Area", (10, h - 20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                # Find the bounding box of the workpiece mask
+                mask_indices = np.where(workpiece_mask > 0)
+                if len(mask_indices[0]) > 0:
+                    y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
+                    x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
+                    
+                    # Draw bounding box
+                    cv2.rectangle(combined_vis, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                    
+                    # Add a label for the workpiece area
+                    cv2.putText(combined_vis, "Workpiece Area", (x_min, y_min - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
             # Add 3D coordinate axes at center of image
             self._add_3d_coordinate_axes_to_normal_map(combined_vis, normals, depth_map, w, h)
@@ -1565,7 +2143,7 @@ class KeypointProcessor3D:
             print(f"DEBUG: Tangent vectors: t1={tangent1}, t2={tangent2}")
 
             # Scale factor for visualization
-            axis_length_3d = 0.2  # 20cm in 3D space (increased for better visibility)
+            axis_length_3d = 0.5  # 50cm in 3D space (increased for better visibility)
 
             # Project 3D axes back to 2D for visualization
             def project_3d_to_2d(point_3d):
@@ -1576,39 +2154,60 @@ class KeypointProcessor3D:
                 y = int(CAMERA_CY + point_3d[1] * CAMERA_FY / point_3d[2])
                 return (x, y)
 
-            # Draw the three axes - only if they project successfully and are visible
+            # Check if all three axes are valid before drawing any of them
             # Z-axis (normal vector) - Blue
             normal_end_3d = np.array([center_3d_x, center_3d_y, center_3d_z]) + center_normal * axis_length_3d
             normal_end_2d = project_3d_to_2d(normal_end_3d)
             
-            if normal_end_2d and normal_end_2d != (center_x, center_y):
-                # Check if projection is within bounds
-                if 0 <= normal_end_2d[0] < img_width and 0 <= normal_end_2d[1] < img_height:
-                    cv2.arrowedLine(frame, (center_x, center_y), normal_end_2d, (255, 0, 0), 3, tipLength=0.3)
-                    cv2.putText(frame, "N", normal_end_2d, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-                    print(f"DEBUG: Drew normal axis from ({center_x}, {center_y}) to {normal_end_2d}")
-
             # X-axis (first tangent) - Red
             tangent1_end_3d = np.array([center_3d_x, center_3d_y, center_3d_z]) + tangent1 * axis_length_3d
             tangent1_end_2d = project_3d_to_2d(tangent1_end_3d)
             
-            if tangent1_end_2d and tangent1_end_2d != (center_x, center_y):
-                # Check if projection is within bounds
-                if 0 <= tangent1_end_2d[0] < img_width and 0 <= tangent1_end_2d[1] < img_height:
-                    cv2.arrowedLine(frame, (center_x, center_y), tangent1_end_2d, (0, 0, 255), 3, tipLength=0.3)
-                    cv2.putText(frame, "T1", tangent1_end_2d, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    print(f"DEBUG: Drew tangent1 axis from ({center_x}, {center_y}) to {tangent1_end_2d}")
-
             # Y-axis (second tangent) - Green
             tangent2_end_3d = np.array([center_3d_x, center_3d_y, center_3d_z]) + tangent2 * axis_length_3d
             tangent2_end_2d = project_3d_to_2d(tangent2_end_3d)
             
-            if tangent2_end_2d and tangent2_end_2d != (center_x, center_y):
-                # Check if projection is within bounds
-                if 0 <= tangent2_end_2d[0] < img_width and 0 <= tangent2_end_2d[1] < img_height:
-                    cv2.arrowedLine(frame, (center_x, center_y), tangent2_end_2d, (0, 255, 0), 3, tipLength=0.3)
-                    cv2.putText(frame, "T2", tangent2_end_2d, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    print(f"DEBUG: Drew tangent2 axis from ({center_x}, {center_y}) to {tangent2_end_2d}")
+            # Check if all three axes are valid and within bounds
+            axes_valid = []
+            
+            # Check normal axis (Z)
+            if (normal_end_2d and normal_end_2d != (center_x, center_y) and
+                0 <= normal_end_2d[0] < img_width and 0 <= normal_end_2d[1] < img_height):
+                axes_valid.append(("normal", normal_end_2d))
+            
+            # Check tangent1 axis (X)
+            if (tangent1_end_2d and tangent1_end_2d != (center_x, center_y) and
+                0 <= tangent1_end_2d[0] < img_width and 0 <= tangent1_end_2d[1] < img_height):
+                axes_valid.append(("tangent1", tangent1_end_2d))
+            
+            # Check tangent2 axis (Y)
+            if (tangent2_end_2d and tangent2_end_2d != (center_x, center_y) and
+                0 <= tangent2_end_2d[0] < img_width and 0 <= tangent2_end_2d[1] < img_height):
+                axes_valid.append(("tangent2", tangent2_end_2d))
+            
+            # Only draw all axes if all three are valid
+            if len(axes_valid) == 3:
+                print(f"DEBUG: All three coordinate axes are valid - drawing complete coordinate system")
+                
+                # Draw Z-axis (normal vector) - Blue
+                cv2.arrowedLine(frame, (center_x, center_y), axes_valid[0][1], (255, 0, 0), 3, tipLength=0.3)
+                cv2.putText(frame, "N", axes_valid[0][1], cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+                print(f"DEBUG: Drew normal axis from ({center_x}, {center_y}) to {axes_valid[0][1]}")
+                
+                # Draw X-axis (first tangent) - Red
+                cv2.arrowedLine(frame, (center_x, center_y), axes_valid[1][1], (0, 0, 255), 3, tipLength=0.3)
+                cv2.putText(frame, "T1", axes_valid[1][1], cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                print(f"DEBUG: Drew tangent1 axis from ({center_x}, {center_y}) to {axes_valid[1][1]}")
+                
+                # Draw Y-axis (second tangent) - Green
+                cv2.arrowedLine(frame, (center_x, center_y), axes_valid[2][1], (0, 255, 0), 3, tipLength=0.3)
+                cv2.putText(frame, "T2", axes_valid[2][1], cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                print(f"DEBUG: Drew tangent2 axis from ({center_x}, {center_y}) to {axes_valid[2][1]}")
+                
+            else:
+                print(f"DEBUG: Only {len(axes_valid)} out of 3 coordinate axes are valid - not drawing any axes")
+                print(f"DEBUG: Valid axes: {[axis[0] for axis in axes_valid]}")
+                return
 
             # Draw center point
             cv2.circle(frame, (center_x, center_y), 5, (255, 255, 255), -1)
@@ -1862,8 +2461,15 @@ class KeypointProcessor3D:
                     print(f"DEBUG: Depth map shape: {depth_map.shape if depth_map is not None else 'None'}")
                     print(f"DEBUG: Depth map type: {type(depth_map)}")
                     
+                    # Get ROI coordinates if available
+                    roi_coordinates = None
+                    if hasattr(self, 'workpiece_detector') and self.workpiece_detector is not None:
+                        roi_coordinates = self.workpiece_detector.get_manual_roi()
+                        if roi_coordinates:
+                            print(f"DEBUG: Using ROI coordinates for surface normal alpha: {roi_coordinates}")
+                    
                     # Estimate surface normals from depth map
-                    normals = self.surface_normal_estimator.estimate_normals(depth_map)
+                    normals = self.surface_normal_estimator.estimate_normals(depth_map, roi_coordinates=roi_coordinates)
                     print(f"DEBUG: Surface normals estimated, shape: {normals.shape}")
                     
                     # Add 3D coordinate axes at center of image
@@ -2339,14 +2945,26 @@ def preview_first_frame_3d(api_key, workspace_name, project_name, version_number
                     print(f"   Origin: [{origin[0]:.3f}, {origin[1]:.3f}, {origin[2]:.3f}]")
                 else:
                     print("❌ Workpiece detection failed")
+                
+                # Estimate contact plane normal for preview with VGGT
+                print(f"DEBUG: Preview - About to estimate contact plane normal with {len(preview_keypoints_3d)} keypoints")
+                contact_result = processor.estimate_contact_plane_normal(depth_map, frame.shape[1], frame.shape[0], preview_keypoints_3d, temp_frame_path.name)
+                if contact_result:
+                    print(f"DEBUG: Preview - Contact plane estimation successful with VGGT!")
+                else:
+                    print(f"DEBUG: Preview - Contact plane estimation failed or returned None")
             else:
                 print("⚠️ No depth map available for workpiece detection")
             
             # Draw 3D keypoints on frame
             if actual_predictions:
+                print(f"DEBUG: Preview - About to call draw_keypoints_3d with {len(actual_predictions)} predictions")
                 frame = processor.draw_keypoints_3d(frame, actual_predictions, depth_map)
                 total_keypoints = sum(len(pred.get('keypoints', [])) for pred in actual_predictions)
                 depth_status = "with depth" if depth_map is not None else "without depth"
+                print(f"DEBUG: Preview - draw_keypoints_3d completed, total keypoints: {total_keypoints}")
+            else:
+                print(f"DEBUG: Preview - No actual_predictions to draw")
                 print(f"Preview: Found {len(actual_predictions)} predictions with {total_keypoints} total keypoints {depth_status}")
             
             # Create depth visualization
@@ -3042,7 +3660,14 @@ class WorkpieceDetector:
                 print(f"DEBUG: Masked depth std: {masked_depth.std():.1f}")
                 print(f"DEBUG: Masked depth unique values: {len(np.unique(masked_depth))}")
             
-            normals = self.surface_normal_estimator.estimate_normals(depth_map, mask=workpiece_mask)
+            # Get ROI coordinates if available
+            roi_coordinates = None
+            if hasattr(self, 'workpiece_detector') and self.workpiece_detector is not None:
+                roi_coordinates = self.workpiece_detector.get_manual_roi()
+                if roi_coordinates:
+                    print(f"DEBUG: Using ROI coordinates for surface normal alpha: {roi_coordinates}")
+            
+            normals = self.surface_normal_estimator.estimate_normals(depth_map, mask=workpiece_mask, roi_coordinates=roi_coordinates)
             
             # Get statistics to find valid normals
             stats = self.surface_normal_estimator.get_normal_statistics(normals)
@@ -3387,6 +4012,220 @@ class WorkpieceDetector:
         print(f"Workpiece origin (ROI center): {self.workpiece_origin}")
         
         return True
+    
+    def estimate_contact_plane_normal(self, electrode_tip_3d, electrode_axis, depth_map, camera_intrinsics, roi_radius_pixels=50):
+        """
+        Estimate the local plane normal at the anticipated contact region.
+        
+        Args:
+            electrode_tip_3d (np.ndarray): 3D position of electrode tip [x, y, z]
+            electrode_axis (np.ndarray): Normalized electrode axis vector [x, y, z]
+            depth_map (np.ndarray): Depth map (HxW)
+            camera_intrinsics (dict): Camera intrinsic parameters {fx, fy, cx, cy}
+            roi_radius_pixels (int): Radius of ROI around contact region in pixels
+            
+        Returns:
+            dict: Contact plane data including normal, point, and confidence
+        """
+        print(f"DEBUG: Starting contact plane normal estimation")
+        print(f"DEBUG: Electrode tip 3D: {electrode_tip_3d}")
+        print(f"DEBUG: Electrode axis: {electrode_axis}")
+        print(f"DEBUG: ROI radius: {roi_radius_pixels} pixels")
+        
+        try:
+            # Step 1: Project electrode tip to 2D image coordinates
+            fx = camera_intrinsics['fx']
+            fy = camera_intrinsics['fy']
+            cx = camera_intrinsics['cx']
+            cy = camera_intrinsics['cy']
+            
+            # Convert 3D electrode tip to 2D pixel coordinates
+            if electrode_tip_3d[2] <= 0:
+                print("ERROR: Invalid electrode tip depth (z <= 0)")
+                return None
+                
+            tip_x_2d = int((electrode_tip_3d[0] * fx / electrode_tip_3d[2]) + cx)
+            tip_y_2d = int((electrode_tip_3d[1] * fy / electrode_tip_3d[2]) + cy)
+            
+            print(f"DEBUG: Electrode tip 2D: ({tip_x_2d}, {tip_y_2d})")
+            
+            # Step 2: Create ROI around the electrode tip
+            h, w = depth_map.shape
+            roi_x1 = max(0, tip_x_2d - roi_radius_pixels)
+            roi_y1 = max(0, tip_y_2d - roi_radius_pixels)
+            roi_x2 = min(w, tip_x_2d + roi_radius_pixels)
+            roi_y2 = min(h, tip_y_2d + roi_radius_pixels)
+            
+            # Check if ROI is valid (not empty)
+            if roi_x1 >= roi_x2 or roi_y1 >= roi_y2:
+                print(f"ERROR: Invalid ROI - electrode tip projected outside image bounds")
+                print(f"DEBUG: Image bounds: {w}x{h}, Tip 2D: ({tip_x_2d}, {tip_y_2d}), ROI: ({roi_x1}, {roi_y1}, {roi_x2}, {roi_y2})")
+                return None
+            
+            contact_region_roi = (roi_x1, roi_y1, roi_x2, roi_y2)
+            print(f"DEBUG: Contact region ROI: ({roi_x1}, {roi_y1}, {roi_x2}, {roi_y2})")
+            
+            # Step 3: Extract depth ROI
+            depth_roi = depth_map[roi_y1:roi_y2, roi_x1:roi_x2]
+            print(f"DEBUG: Depth ROI shape: {depth_roi.shape}")
+            
+            # Check if depth ROI is valid
+            if depth_roi.size == 0:
+                print(f"ERROR: Empty depth ROI")
+                return None
+                
+            print(f"DEBUG: Depth ROI range: {depth_roi.min():.3f} to {depth_roi.max():.3f}")
+            
+            # Step 4: Convert depth ROI to 3D points
+            points_3d = self._depth_roi_to_3d_points(depth_roi, roi_x1, roi_y1, fx, fy, cx, cy)
+            print(f"DEBUG: Converted {len(points_3d)} 3D points from depth ROI")
+            
+            if len(points_3d) < 10:
+                print(f"ERROR: Insufficient points in contact region: {len(points_3d)}")
+                return None
+            
+            # Step 5: Fit local plane using RANSAC
+            plane_params = self._fit_plane_to_points(points_3d)
+            if plane_params is None:
+                print("ERROR: Failed to fit plane to contact region")
+                return None
+            
+            # Step 6: Extract plane normal and ensure it points toward camera
+            a, b, c, d = plane_params
+            normal = np.array([a, b, c])
+            normal_norm = np.linalg.norm(normal)
+            if normal_norm == 0:
+                print("ERROR: Invalid normal vector")
+                return None
+            
+            normal = normal / normal_norm
+            
+            # Ensure normal points toward camera (positive Z in camera coordinates)
+            if normal[2] < 0:
+                normal = -normal
+                d = -d
+            
+            # Step 7: Calculate ray-plane intersection
+            contact_point = self._ray_plane_intersection(electrode_tip_3d, electrode_axis, normal, d)
+            if contact_point is None:
+                print("ERROR: Failed to calculate ray-plane intersection")
+                return None
+            
+            # Step 8: Calculate confidence based on plane fit quality
+            confidence = self._calculate_plane_fit_confidence(points_3d, plane_params)
+            
+            print(f"✅ Contact plane normal estimated successfully")
+            print(f"Contact plane normal: {normal}")
+            print(f"Contact point 3D: {contact_point}")
+            print(f"Confidence: {confidence:.3f}")
+            
+            return {
+                'normal': normal,
+                'contact_point': contact_point,
+                'roi': contact_region_roi,
+                'confidence': confidence,
+                'plane_params': plane_params
+            }
+            
+        except Exception as e:
+            print(f"ERROR in contact plane estimation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _depth_roi_to_3d_points(self, depth_roi, roi_x1, roi_y1, fx, fy, cx, cy):
+        """Convert depth ROI to 3D points in camera coordinates"""
+        points = []
+        h, w = depth_roi.shape
+        
+        # Sample points (every 2nd pixel for better density in small ROI)
+        for y in range(0, h, 2):
+            for x in range(0, w, 2):
+                depth_value = depth_roi[y, x]
+                
+                # Skip invalid depth values
+                if depth_value <= 0:
+                    continue
+                
+                # Convert to real-world depth
+                depth_meters = depth_value / DEPTH_SCALE_FACTOR
+                
+                # Convert pixel coordinates to camera coordinates
+                pixel_x = roi_x1 + x
+                pixel_y = roi_y1 + y
+                
+                # Back-project to 3D using camera intrinsics
+                x_3d = (pixel_x - cx) * depth_meters / fx
+                y_3d = (pixel_y - cy) * depth_meters / fy
+                z_3d = depth_meters
+                
+                points.append([x_3d, y_3d, z_3d])
+        
+        return np.array(points)
+    
+    def _ray_plane_intersection(self, ray_origin, ray_direction, plane_normal, plane_d):
+        """
+        Calculate intersection point of ray with plane.
+        
+        Args:
+            ray_origin (np.ndarray): Ray origin point [x, y, z]
+            ray_direction (np.ndarray): Normalized ray direction [x, y, z]
+            plane_normal (np.ndarray): Normalized plane normal [x, y, z]
+            plane_d (float): Plane equation constant (ax + by + cz + d = 0)
+            
+        Returns:
+            np.ndarray: Intersection point [x, y, z] or None if no intersection
+        """
+        # Ray equation: P = P0 + t * direction
+        # Plane equation: ax + by + cz + d = 0
+        
+        # Calculate denominator: n · direction
+        denominator = np.dot(plane_normal, ray_direction)
+        
+        if abs(denominator) < 1e-6:
+            print("ERROR: Ray is parallel to plane")
+            return None
+        
+        # Calculate t parameter
+        # t = -(n · P0 + d) / (n · direction)
+        numerator = np.dot(plane_normal, ray_origin) + plane_d
+        t = -numerator / denominator
+        
+        # Check if intersection is in front of ray origin
+        if t < 0:
+            print(f"WARNING: Intersection is behind ray origin (t={t})")
+            # Still return the point for debugging
+        
+        # Calculate intersection point
+        intersection_point = ray_origin + t * ray_direction
+        
+        print(f"DEBUG: Ray-plane intersection: t={t:.4f}, point={intersection_point}")
+        
+        return intersection_point
+    
+    def _calculate_plane_fit_confidence(self, points_3d, plane_params):
+        """Calculate confidence score for plane fit based on RANSAC inlier ratio"""
+        if len(points_3d) < 3:
+            return 0.0
+        
+        # Calculate distances from points to plane
+        a, b, c, d = plane_params
+        distances = np.abs(a * points_3d[:, 0] + b * points_3d[:, 1] + c * points_3d[:, 2] + d)
+        
+        # Count inliers (points within threshold distance)
+        threshold = WORKPIECE_RANSAC_THRESHOLD
+        inliers = np.sum(distances < threshold)
+        inlier_ratio = inliers / len(points_3d)
+        
+        # Additional confidence based on point count
+        point_confidence = min(1.0, len(points_3d) / 100.0)
+        
+        # Combined confidence
+        confidence = (inlier_ratio * 0.7) + (point_confidence * 0.3)
+        
+        print(f"DEBUG: Plane fit confidence - inliers: {inliers}/{len(points_3d)} ({inlier_ratio:.3f}), point_confidence: {point_confidence:.3f}, final: {confidence:.3f}")
+        
+        return confidence
 
 class TravelTracker:
     def __init__(self, history_length=TRAVEL_HISTORY_LENGTH):
