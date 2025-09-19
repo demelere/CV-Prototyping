@@ -20,6 +20,12 @@ class WorkpieceDetector:
         self.coordinate_transform_matrix = None
         self.detection_confidence = 0.0
         
+        # Contact plane estimation
+        self.contact_plane_normal = None
+        self.contact_point_3d = None
+        self.contact_region_roi = None
+        self.contact_plane_confidence = 0.0
+        
     def detect_workpiece_surface(self, depth_map, frame_width, frame_height, keypoints_3d=None):
         """Detect workpiece surface using depth map and optionally keypoint guidance"""
         if depth_map is None:
@@ -485,3 +491,238 @@ class WorkpieceDetector:
         transformed_point = np.dot(self.coordinate_transform_matrix, point_homogeneous)
         
         return transformed_point[:3]
+    
+    def estimate_contact_plane_normal(self, electrode_tip_3d, electrode_axis, depth_map, camera_intrinsics, roi_radius_pixels=50):
+        """
+        Estimate the local plane normal at the anticipated contact region.
+        
+        Args:
+            electrode_tip_3d (np.ndarray): 3D position of electrode tip [x, y, z]
+            electrode_axis (np.ndarray): Normalized electrode axis vector [x, y, z]
+            depth_map (np.ndarray): Depth map (HxW)
+            camera_intrinsics (dict): Camera intrinsic parameters {fx, fy, cx, cy}
+            roi_radius_pixels (int): Radius of ROI around contact region in pixels
+            
+        Returns:
+            dict: Contact plane data including normal, point, and confidence
+        """
+        print(f"DEBUG: Starting contact plane normal estimation")
+        print(f"DEBUG: Electrode tip 3D: {electrode_tip_3d}")
+        print(f"DEBUG: Electrode axis: {electrode_axis}")
+        print(f"DEBUG: ROI radius: {roi_radius_pixels} pixels")
+        
+        try:
+            # Step 1: Project electrode tip to 2D image coordinates
+            fx = camera_intrinsics['fx']
+            fy = camera_intrinsics['fy']
+            cx = camera_intrinsics['cx']
+            cy = camera_intrinsics['cy']
+            
+            # Convert 3D electrode tip to 2D pixel coordinates
+            if electrode_tip_3d[2] <= 0:
+                print("ERROR: Invalid electrode tip depth (z <= 0)")
+                return None
+                
+            tip_x_2d = int((electrode_tip_3d[0] * fx / electrode_tip_3d[2]) + cx)
+            tip_y_2d = int((electrode_tip_3d[1] * fy / electrode_tip_3d[2]) + cy)
+            
+            print(f"DEBUG: Electrode tip 2D: ({tip_x_2d}, {tip_y_2d})")
+            
+            # Step 2: Create ROI around the electrode tip
+            h, w = depth_map.shape
+            roi_x1 = max(0, tip_x_2d - roi_radius_pixels)
+            roi_y1 = max(0, tip_y_2d - roi_radius_pixels)
+            roi_x2 = min(w, tip_x_2d + roi_radius_pixels)
+            roi_y2 = min(h, tip_y_2d + roi_radius_pixels)
+            
+            # Check if ROI is valid (not empty)
+            if roi_x1 >= roi_x2 or roi_y1 >= roi_y2:
+                print(f"ERROR: Invalid ROI - electrode tip projected outside image bounds")
+                print(f"DEBUG: Image bounds: {w}x{h}, Tip 2D: ({tip_x_2d}, {tip_y_2d}), ROI: ({roi_x1}, {roi_y1}, {roi_x2}, {roi_y2})")
+                return None
+            
+            self.contact_region_roi = (roi_x1, roi_y1, roi_x2, roi_y2)
+            print(f"DEBUG: Contact region ROI: ({roi_x1}, {roi_y1}, {roi_x2}, {roi_y2})")
+            
+            # Step 3: Extract depth ROI
+            depth_roi = depth_map[roi_y1:roi_y2, roi_x1:roi_x2]
+            print(f"DEBUG: Depth ROI shape: {depth_roi.shape}")
+            
+            # Check if depth ROI is valid
+            if depth_roi.size == 0:
+                print(f"ERROR: Empty depth ROI")
+                return None
+                
+            print(f"DEBUG: Depth ROI range: {depth_roi.min():.3f} to {depth_roi.max():.3f}")
+            
+            # Step 4: Convert depth ROI to 3D points
+            points_3d = self._depth_roi_to_3d_points(depth_roi, roi_x1, roi_y1, fx, fy, cx, cy)
+            print(f"DEBUG: Converted {len(points_3d)} 3D points from depth ROI")
+            
+            if len(points_3d) < 10:
+                print(f"ERROR: Insufficient points in contact region: {len(points_3d)}")
+                return None
+            
+            # Step 5: Fit local plane using RANSAC
+            plane_params = self._fit_plane_to_points(points_3d)
+            if plane_params is None:
+                print("ERROR: Failed to fit plane to contact region")
+                return None
+            
+            # Step 6: Extract plane normal and ensure it points toward camera
+            a, b, c, d = plane_params
+            normal = np.array([a, b, c])
+            normal_norm = np.linalg.norm(normal)
+            if normal_norm == 0:
+                print("ERROR: Invalid normal vector")
+                return None
+            
+            normal = normal / normal_norm
+            
+            # Ensure normal points toward camera (positive Z in camera coordinates)
+            if normal[2] < 0:
+                normal = -normal
+                d = -d
+            
+            # Step 7: Calculate ray-plane intersection
+            contact_point = self._ray_plane_intersection(electrode_tip_3d, electrode_axis, normal, d)
+            if contact_point is None:
+                print("ERROR: Failed to calculate ray-plane intersection")
+                return None
+            
+            # Step 8: Calculate confidence based on plane fit quality
+            confidence = self._calculate_plane_fit_confidence(points_3d, plane_params)
+            
+            # Store results
+            self.contact_plane_normal = normal
+            self.contact_point_3d = contact_point
+            self.contact_plane_confidence = confidence
+            
+            print(f"✅ Contact plane normal estimated successfully")
+            print(f"Contact plane normal: {normal}")
+            print(f"Contact point 3D: {contact_point}")
+            print(f"Confidence: {confidence:.3f}")
+            
+            return {
+                'normal': normal,
+                'contact_point': contact_point,
+                'roi': self.contact_region_roi,
+                'confidence': confidence,
+                'plane_params': plane_params
+            }
+            
+        except Exception as e:
+            print(f"ERROR in contact plane estimation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _depth_roi_to_3d_points(self, depth_roi, roi_x1, roi_y1, fx, fy, cx, cy):
+        """Convert depth ROI to 3D points in camera coordinates"""
+        points = []
+        h, w = depth_roi.shape
+        
+        # Sample points (every 2nd pixel for better density in small ROI)
+        for y in range(0, h, 2):
+            for x in range(0, w, 2):
+                depth_value = depth_roi[y, x]
+                
+                # Skip invalid depth values
+                if depth_value <= 0:
+                    continue
+                
+                # Convert to real-world depth
+                depth_meters = depth_value / DEPTH_SCALE_FACTOR
+                
+                # Convert pixel coordinates to camera coordinates
+                pixel_x = roi_x1 + x
+                pixel_y = roi_y1 + y
+                
+                # Back-project to 3D using camera intrinsics
+                x_3d = (pixel_x - cx) * depth_meters / fx
+                y_3d = (pixel_y - cy) * depth_meters / fy
+                z_3d = depth_meters
+                
+                points.append([x_3d, y_3d, z_3d])
+        
+        return np.array(points)
+    
+    def _ray_plane_intersection(self, ray_origin, ray_direction, plane_normal, plane_d):
+        """
+        Calculate intersection point of ray with plane.
+        
+        Args:
+            ray_origin (np.ndarray): Ray origin point [x, y, z]
+            ray_direction (np.ndarray): Normalized ray direction [x, y, z]
+            plane_normal (np.ndarray): Normalized plane normal [x, y, z]
+            plane_d (float): Plane equation constant (ax + by + cz + d = 0)
+            
+        Returns:
+            np.ndarray: Intersection point [x, y, z] or None if no intersection
+        """
+        # Ray equation: P = P0 + t * direction
+        # Plane equation: ax + by + cz + d = 0
+        
+        # Calculate denominator: n · direction
+        denominator = np.dot(plane_normal, ray_direction)
+        
+        if abs(denominator) < 1e-6:
+            print("ERROR: Ray is parallel to plane")
+            return None
+        
+        # Calculate t parameter
+        # t = -(n · P0 + d) / (n · direction)
+        numerator = np.dot(plane_normal, ray_origin) + plane_d
+        t = -numerator / denominator
+        
+        # Check if intersection is in front of ray origin
+        if t < 0:
+            print(f"WARNING: Intersection is behind ray origin (t={t})")
+            # Still return the point for debugging
+        
+        # Calculate intersection point
+        intersection_point = ray_origin + t * ray_direction
+        
+        print(f"DEBUG: Ray-plane intersection: t={t:.4f}, point={intersection_point}")
+        
+        return intersection_point
+    
+    def _calculate_plane_fit_confidence(self, points_3d, plane_params):
+        """Calculate confidence score for plane fit based on RANSAC inlier ratio"""
+        if len(points_3d) < 3:
+            return 0.0
+        
+        # Calculate distances from points to plane
+        a, b, c, d = plane_params
+        distances = np.abs(a * points_3d[:, 0] + b * points_3d[:, 1] + c * points_3d[:, 2] + d)
+        
+        # Count inliers (points within threshold distance)
+        threshold = WORKPIECE_RANSAC_THRESHOLD
+        inliers = np.sum(distances < threshold)
+        inlier_ratio = inliers / len(points_3d)
+        
+        # Additional confidence based on point count
+        point_confidence = min(1.0, len(points_3d) / 100.0)
+        
+        # Combined confidence
+        confidence = (inlier_ratio * 0.7) + (point_confidence * 0.3)
+        
+        print(f"DEBUG: Plane fit confidence - inliers: {inliers}/{len(points_3d)} ({inlier_ratio:.3f}), point_confidence: {point_confidence:.3f}, final: {confidence:.3f}")
+        
+        return confidence
+    
+    def get_contact_plane_normal(self):
+        """Get the contact plane normal vector"""
+        return self.contact_plane_normal
+    
+    def get_contact_point_3d(self):
+        """Get the 3D contact point"""
+        return self.contact_point_3d
+    
+    def get_contact_region_roi(self):
+        """Get the contact region ROI coordinates"""
+        return self.contact_region_roi
+    
+    def get_contact_plane_confidence(self):
+        """Get the confidence of contact plane estimation"""
+        return self.contact_plane_confidence
