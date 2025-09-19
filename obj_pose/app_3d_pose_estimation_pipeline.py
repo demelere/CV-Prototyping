@@ -4418,16 +4418,33 @@ class WorkpieceDetector:
         numerator = np.dot(plane_normal, ray_origin) + plane_d
         t = -numerator / denominator
         
+        # RAY LENGTH CONSTRAINT: Limit ray length to reasonable values
+        # Expected real ray length: ~3/32" (0.0024m), but allow up to 10mm for safety
+        max_ray_length = 0.01  # 10mm maximum ray length
+        original_t = t
+        
+        if t > max_ray_length:
+            t = max_ray_length
+            if correlation_id:
+                contact_plane_logger.log_operation_success(
+                    correlation_id, "RAY_LENGTH_CONSTRAINT_APPLIED",
+                    0,  # No significant time
+                    original_length=original_t,
+                    constrained_length=t,
+                    constraint_reason="ray_length_too_large"
+                )
+        
         # Check if intersection is in front of ray origin
         is_behind = t < 0
         
         # Calculate intersection point
         intersection_point = ray_origin + t * ray_direction
         
-        # Log the intersection result
+        # Log the intersection result (use original_t for distance logging if constraint was applied)
+        distance_to_plane = original_t if t != original_t else (t if is_behind else None)
         contact_plane_logger.log_ray_plane_intersection(
             correlation_id, ray_origin, ray_direction, intersection_point, 
-            t if is_behind else None
+            distance_to_plane
         )
         
         return intersection_point
