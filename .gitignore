@@ -1,3 +1,5 @@
+**/vggt/
+
 # Ignore common 3D model files anywhere
 *.glb
 *.gltf
