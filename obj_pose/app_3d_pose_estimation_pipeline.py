@@ -1657,20 +1657,7 @@ class KeypointProcessor3D:
         if workpiece_normal is None:
             return
         
-        # Draw workpiece bounding box if available
-        if workpiece_mask is not None:
-            # Find the bounding box of the workpiece mask
-            mask_indices = np.where(workpiece_mask > 0)
-            if len(mask_indices[0]) > 0:
-                y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
-                x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
-                
-                # Draw bounding box
-                cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                
-                # Add a label for the workpiece area
-                cv2.putText(frame, "Workpiece Area", (x_min, y_min - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        # Workpiece bounding box removed - keeping only the surface normal visualization
         
         print("DEBUG: Drew workpiece surface indicator with bounding box")
     
@@ -1895,20 +1882,7 @@ class KeypointProcessor3D:
         # Get workpiece mask if available
         workpiece_mask = self.workpiece_detector.get_workpiece_mask()
         
-        # Add workpiece bounding box if available
-        if workpiece_mask is not None:
-            # Find the bounding box of the workpiece mask
-            mask_indices = np.where(workpiece_mask > 0)
-            if len(mask_indices[0]) > 0:
-                y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
-                x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
-                
-                # Draw bounding box
-                cv2.rectangle(depth_colored, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                
-                # Add a label for the workpiece area
-                cv2.putText(depth_colored, "Workpiece Area", (x_min, y_min - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        # Workpiece bounding box removed from depth visualization
         
         # Add surface normal estimation if enabled
         if ENABLE_SURFACE_NORMALS:
@@ -2046,20 +2020,7 @@ class KeypointProcessor3D:
             magnitude_colored = cv2.applyColorMap(magnitude_map, SURFACE_NORMAL_COLOR_MAP)
             magnitude_colored = cv2.resize(magnitude_colored, (w, h))
             
-            # Add workpiece bounding box if available
-            if workpiece_mask is not None:
-                # Find the bounding box of the workpiece mask
-                mask_indices = np.where(workpiece_mask > 0)
-                if len(mask_indices[0]) > 0:
-                    y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
-                    x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
-                    
-                    # Draw bounding box
-                    cv2.rectangle(magnitude_colored, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                    
-                    # Add a label for the workpiece area
-                    cv2.putText(magnitude_colored, "Workpiece Area", (x_min, y_min - 10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # Workpiece bounding box removed from surface normal visualization
             
             # Get normal statistics
             stats = self.surface_normal_estimator.get_normal_statistics(normals)
@@ -2122,20 +2083,7 @@ class KeypointProcessor3D:
             # Combine depth and normal visualizations
             combined_vis = cv2.addWeighted(depth_colored, 0.6, magnitude_colored, 0.4, 0)
             
-            # Add workpiece bounding box if available
-            if workpiece_mask is not None:
-                # Find the bounding box of the workpiece mask
-                mask_indices = np.where(workpiece_mask > 0)
-                if len(mask_indices[0]) > 0:
-                    y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
-                    x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
-                    
-                    # Draw bounding box
-                    cv2.rectangle(combined_vis, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                    
-                    # Add a label for the workpiece area
-                    cv2.putText(combined_vis, "Workpiece Area", (x_min, y_min - 10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # Workpiece bounding box removed from combined visualization
             
             # Add 3D coordinate axes at center of image
             self._add_3d_coordinate_axes_to_normal_map(combined_vis, normals, depth_map, w, h)
