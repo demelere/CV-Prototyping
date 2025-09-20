@@ -97,6 +97,13 @@ SHOW_DEPTH_MAP = True              # Show depth map visualization
 SHOW_3D_COORDINATES = True         # Show 3D coordinates in labels
 DEPTH_SCALE_FACTOR = 1000.0        # Scale factor for depth values (adjust based on your depth model)
 
+# DEPTH SCALING FIX: Test different scaling factors to address 650x scale error
+# Original: 1000.0 (assumes depth values are in mm, convert to m)
+# Test: 1.0 (assumes depth values are already in m)
+# Test: 0.001 (assumes depth values are in mm but need 1000x reduction)
+DEPTH_SCALE_FACTOR_TEST = 1.0      # Test scaling factor for depth values
+USE_DEPTH_SCALE_TEST = True        # Enable depth scaling test
+
 # Camera Parameters (you'll need to calibrate these for your camera)
 CAMERA_FX = 1512.0  # Focal length in pixels (X direction) - iPhone 15 52mm telephoto
 CAMERA_FY = 1512.0  # Focal length in pixels (Y direction) - iPhone 15 52mm telephoto
@@ -3328,7 +3335,11 @@ class WorkpieceDetector:
                     continue
                 
                 # Convert to real-world depth
-                depth_meters = depth_value / DEPTH_SCALE_FACTOR
+                # DEPTH SCALING FIX: Use test scaling factor to address 650x scale error
+                if USE_DEPTH_SCALE_TEST:
+                    depth_meters = depth_value / DEPTH_SCALE_FACTOR_TEST
+                else:
+                    depth_meters = depth_value / DEPTH_SCALE_FACTOR
                 
                 # Back-project to 3D using camera intrinsics
                 x_3d = (x - CAMERA_CX) * depth_meters / CAMERA_FX
@@ -3539,7 +3550,11 @@ class WorkpieceDetector:
                     continue
                 
                 # Convert to real-world depth
-                depth_meters = depth_value / DEPTH_SCALE_FACTOR
+                # DEPTH SCALING FIX: Use test scaling factor to address 650x scale error
+                if USE_DEPTH_SCALE_TEST:
+                    depth_meters = depth_value / DEPTH_SCALE_FACTOR_TEST
+                else:
+                    depth_meters = depth_value / DEPTH_SCALE_FACTOR
                 
                 # Convert pixel coordinates to camera coordinates
                 pixel_x = roi_x + x
@@ -4221,6 +4236,16 @@ class WorkpieceDetector:
                 depth_stats, valid_pixels
             )
             
+            # Log depth scaling configuration
+            if USE_DEPTH_SCALE_TEST:
+                contact_plane_logger.log_operation_success(
+                    correlation_id, "DEPTH_SCALING_TEST_APPLIED",
+                    0,  # No significant time
+                    original_scale=DEPTH_SCALE_FACTOR,
+                    test_scale=DEPTH_SCALE_FACTOR_TEST,
+                    scale_reduction=DEPTH_SCALE_FACTOR / DEPTH_SCALE_FACTOR_TEST
+                )
+            
             # Step 4: Convert depth ROI to 3D points
             points_3d = self._depth_roi_to_3d_points(depth_roi, roi_x1, roi_y1, fx, fy, cx, cy, correlation_id)
             
@@ -4371,7 +4396,11 @@ class WorkpieceDetector:
                     continue
                 
                 # Convert to real-world depth
-                depth_meters = depth_value / DEPTH_SCALE_FACTOR
+                # DEPTH SCALING FIX: Use test scaling factor to address 650x scale error
+                if USE_DEPTH_SCALE_TEST:
+                    depth_meters = depth_value / DEPTH_SCALE_FACTOR_TEST
+                else:
+                    depth_meters = depth_value / DEPTH_SCALE_FACTOR
                 
                 # Convert pixel coordinates to camera coordinates
                 pixel_x = roi_x1 + x
