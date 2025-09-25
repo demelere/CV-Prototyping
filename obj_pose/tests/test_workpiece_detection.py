@@ -4,7 +4,6 @@ Test script for workpiece detection and tracking functionality
 """
 
 import numpy as np
-import cv2
 from app_3d_pose_estimation_pipeline import WorkpieceDetector, TravelTracker
 import time
 

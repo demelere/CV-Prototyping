@@ -142,10 +142,6 @@ def estimate_surface_normals(depth_map, fx, fy, ox, oy, alpha, mask=None, r_thre
         # Calculate normal vector components using the closed-form expressions (Equations 10, 11, and 12)
         # For quantized depth data, we need to scale the gradients appropriately
         
-        # Calculate depth gradients
-        grad_x = (d3 - d5) / (2 * alpha)  # Right - left
-        grad_y = (d2 - d4) / (2 * alpha)  # Top - bottom
-        
         # Original formulation (modified for better numerical stability)
         nx = -alpha / (4 * fy) * (d3 + d5) * (d2 - d4)
         ny = -alpha / (4 * fx) * (d2 + d4) * (d3 - d5)
@@ -222,33 +218,6 @@ def estimate_surface_normals(depth_map, fx, fy, ox, oy, alpha, mask=None, r_thre
     
     return normals
 
-def apply_mask(depth_map, mask):
-    """
-    Applies a mask to a depth map, returning only the region of interest.
-    Pixels outside the mask are set to zero.
-
-    Args:
-        depth_map (np.ndarray): The original depth map.
-        mask (np.ndarray): A boolean or integer mask to apply.
-
-    Returns:
-        np.ndarray: The masked depth map.
-    """
-    if mask.shape != depth_map.shape:
-        raise ValueError("Mask must have the same dimensions as the depth map.")
-    return np.where(mask, depth_map, 0)
-
-def create_inverse_mask(mask):
-    """
-    Creates an inverse mask from a given mask.
-
-    Args:
-        mask (np.ndarray): A boolean or integer mask.
-
-    Returns:
-        np.ndarray: The inverted mask.
-    """
-    return ~mask
 
 def visualize_surface_normals(normals, output_size=None):
     """

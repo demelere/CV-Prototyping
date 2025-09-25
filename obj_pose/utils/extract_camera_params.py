@@ -93,10 +93,8 @@ def estimate_camera_params(width, height):
     # Approximate sensor dimensions in pixels (depends on recording resolution)
     if width >= 3840:  # 4K
         sensor_width_pixels = width
-        sensor_height_pixels = height
     else:  # 1080p or lower
         sensor_width_pixels = width
-        sensor_height_pixels = height
     
     # Estimate based on 24mm equivalent (most common for main camera)
     focal_length_mm = 6.86  # Physical focal length for 24mm equivalent

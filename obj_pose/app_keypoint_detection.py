@@ -1,11 +1,8 @@
 import gradio as gr
 import cv2
-import numpy as np
 from roboflow import Roboflow
 import tempfile
 import os
-from PIL import Image
-import json
 
 # ============================================================================
 # CONFIGURATION PARAMETERS - ADJUST THESE AS NEEDED

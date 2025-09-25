@@ -8,9 +8,7 @@ import logging
 import time
 import uuid
 import numpy as np
-from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
-import json
 
 class ContactPlaneLogger:
     """

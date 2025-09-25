@@ -5,16 +5,14 @@ from roboflow import Roboflow
 import tempfile
 import os
 from PIL import Image
-import json
 from transformers import pipeline
 import torch
 from sklearn.cluster import DBSCAN
 from sklearn.linear_model import RANSACRegressor
-from scipy.spatial.distance import cdist
 from collections import deque
 import time
 from dotenv import load_dotenv
-from core.surface_normal_estimator import SurfaceNormalEstimator, visualize_surface_normals, create_normal_magnitude_map
+from core.surface_normal_estimator import SurfaceNormalEstimator, create_normal_magnitude_map
 from utils.log_capture import log_capture
 from utils.depth_logger import create_depth_logger
 from utils.contact_plane_logger import contact_plane_logger
@@ -1188,11 +1186,6 @@ class KeypointProcessor3D:
         name = keypoint_3d.get('name', keypoint_3d.get('class', 'unknown'))
         confidence = keypoint_3d.get('confidence', 0)
         
-        # Convert to millimeters for better readability
-        x_mm = keypoint_3d.get('x_3d', 0) * 1000
-        y_mm = keypoint_3d.get('y_3d', 0) * 1000
-        z_mm = keypoint_3d.get('z_3d', 0) * 1000
-        
         # Format confidence as percentage
         confidence_pct = confidence * 100
         
@@ -1294,7 +1287,6 @@ class KeypointProcessor3D:
                 
                 confidence = keypoint['confidence']
                 parent_object = keypoint.get('parent_object', 'unknown')
-                keypoint_class = keypoint.get('class', 'unknown')
                 
                 # Skip low confidence keypoints
                 confidence_threshold = CONFIDENCE_THRESHOLD / 100.0 if CONFIDENCE_THRESHOLD > 1 else CONFIDENCE_THRESHOLD
@@ -1652,7 +1644,6 @@ class KeypointProcessor3D:
     def draw_workpiece_surface_indicator(self, frame, img_width, img_height):
         """Draw a visual indicator of the detected workpiece surface"""
         workpiece_normal = self.workpiece_detector.get_workpiece_normal()
-        workpiece_mask = self.workpiece_detector.get_workpiece_mask()
         
         if workpiece_normal is None:
             return
@@ -1931,7 +1922,7 @@ class KeypointProcessor3D:
                     normals = self.surface_normal_estimator.estimate_normals(depth_map, roi_coordinates=roi_coordinates)
                 
                 # Create normal visualization
-                normal_vis = self.surface_normal_estimator.create_visualization(normals, (w, h))
+                self.surface_normal_estimator.create_visualization(normals, (w, h))
                 
                 # Create magnitude map for better visualization
                 magnitude_map = create_normal_magnitude_map(normals)
@@ -2013,7 +2004,7 @@ class KeypointProcessor3D:
             h, w = original_frame.shape[:2]
             
             # Create normal visualization
-            normal_vis = self.surface_normal_estimator.create_visualization(normals, (w, h))
+            self.surface_normal_estimator.create_visualization(normals, (w, h))
             
             # Create magnitude map for better visualization
             magnitude_map = create_normal_magnitude_map(normals)
@@ -2338,7 +2329,6 @@ class KeypointProcessor3D:
                 confidence = keypoint_3d['confidence']
                 depth = keypoint_3d['depth']
                 parent_object = keypoint_3d.get('parent_object', 'unknown')
-                keypoint_class = keypoint_3d.get('class', 'unknown')
                 
                 # Skip low confidence keypoints
                 confidence_threshold = CONFIDENCE_THRESHOLD / 100.0 if CONFIDENCE_THRESHOLD > 1 else CONFIDENCE_THRESHOLD
@@ -3812,7 +3802,7 @@ class WorkpieceDetector:
                     corrected_normal = corrected_normal / np.linalg.norm(corrected_normal)
                     
                     print(f"DEBUG: Systematic gradient correction:")
-                    print(f"  - Original mean normal: {mean_normal}")
+                    # print(f"  - Original mean normal: {mean_normal}")
                     print(f"  - Corrected normal: {corrected_normal}")
                     print(f"  - Gradient-based correction applied")
                     
@@ -3820,12 +3810,12 @@ class WorkpieceDetector:
                     representative_normal = corrected_normal
                     
                     # Check if corrected normal is reasonable
-                    if abs(representative_normal[0]) < vertical_threshold and abs(representative_normal[1]) < vertical_threshold:
-                        print(f"WARNING: Corrected normal is still too vertical")
-                        print(f"  Using tilted normal for visualization")
-                        tilted_normal = np.array([0.15, 0.15, 0.975])
-                        tilted_normal = tilted_normal / np.linalg.norm(tilted_normal)
-                        return tilted_normal
+                    # if abs(representative_normal[0]) < vertical_threshold and abs(representative_normal[1]) < vertical_threshold:
+                    #     print(f"WARNING: Corrected normal is still too vertical")
+                    #     print(f"  Using tilted normal for visualization")
+                    #     tilted_normal = np.array([0.15, 0.15, 0.975])
+                    #     tilted_normal = tilted_normal / np.linalg.norm(tilted_normal)
+                    #     return tilted_normal
                     
                     return representative_normal
                 else:

@@ -81,14 +81,12 @@ class CameraPoseExtractor:
             raise
     
     def extract_camera_pose(self, 
-                           image_paths: Union[str, list],
-                           return_confidence: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+                           image_paths: Union[str, list]) -> Tuple[np.ndarray, np.ndarray]:
         """
         Extract camera extrinsic and intrinsic parameters from images.
         
         Args:
             image_paths: Path to a single image or list of image paths
-            return_confidence: Whether to return confidence scores (not implemented yet)
             
         Returns:
             Tuple of (extrinsic_matrices, intrinsic_matrices)
@@ -119,7 +117,7 @@ class CameraPoseExtractor:
                         images = images[None]
                     
                     # Get aggregated tokens
-                    aggregated_tokens_list, ps_idx = self.model.aggregator(images)
+                    aggregated_tokens_list, _ = self.model.aggregator(images)
                     
                     # Predict camera parameters
                     pose_enc = self.model.camera_head(aggregated_tokens_list)[-1]
@@ -199,30 +197,6 @@ class CameraPoseExtractor:
             'cx': cx,
             'cy': cy
         }
-    
-    def save_camera_parameters(self, 
-                              image_path: str, 
-                              output_path: str):
-        """
-        Extract camera parameters and save to a file.
-        
-        Args:
-            image_path: Path to the image
-            output_path: Path to save the camera parameters (.npz format)
-        """
-        params = self.get_camera_parameters_dict(image_path)
-        
-        np.savez(output_path,
-                extrinsic=params['extrinsic'],
-                intrinsic=params['intrinsic'],
-                rotation=params['rotation'],
-                translation=params['translation'],
-                fx=params['fx'],
-                fy=params['fy'],
-                cx=params['cx'],
-                cy=params['cy'])
-        
-        logging.info(f"Camera parameters saved to: {output_path}")
 
     def extract_or_get_cached_pose(self, image_path: str) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -256,35 +230,6 @@ class CameraPoseExtractor:
         
         logging.info("Camera pose cached for subsequent frames")
         return extrinsic, intrinsic
-    
-    def get_intrinsics_with_fallback(self, 
-                                   image_path: str, 
-                                   metadata_intrinsics: Optional[dict] = None) -> Tuple[float, float, float, float]:
-        """
-        Get camera intrinsics with fallback to VGGT if metadata is unavailable.
-        
-        Args:
-            image_path: Path to the image
-            metadata_intrinsics: Dict with 'fx', 'fy', 'cx', 'cy' from image metadata (optional)
-            
-        Returns:
-            Tuple of (fx, fy, cx, cy) focal lengths and principal point
-        """
-        if metadata_intrinsics and all(k in metadata_intrinsics for k in ['fx', 'fy', 'cx', 'cy']):
-            logging.info("Using camera intrinsics from image metadata")
-            return (metadata_intrinsics['fx'], metadata_intrinsics['fy'], 
-                   metadata_intrinsics['cx'], metadata_intrinsics['cy'])
-        
-        # Fallback to VGGT
-        logging.info("No metadata intrinsics found, using VGGT as fallback")
-        _, intrinsic = self.extract_or_get_cached_pose(image_path)
-        
-        fx = intrinsic[0, 0]
-        fy = intrinsic[1, 1] 
-        cx = intrinsic[0, 2]
-        cy = intrinsic[1, 2]
-        
-        return fx, fy, cx, cy
     
     def apply_gravity_prior(self, extrinsic_matrix: np.ndarray, 
                            forward_pitch_degrees: float = 15.0) -> np.ndarray:
@@ -351,68 +296,6 @@ class CameraPoseExtractor:
         logging.info(f"Original translation: [{translation[0]:.3f}, {translation[1]:.3f}, {translation[2]:.3f}]")
         
         return gravity_extrinsic
-    
-    def extract_or_get_cached_pose_with_gravity_prior(self, 
-                                                     image_path: str,
-                                                     forward_pitch_degrees: float = 15.0) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Extract camera pose with gravity prior applied.
-        
-        Args:
-            image_path: Path to the image
-            forward_pitch_degrees: Forward pitch angle in degrees (default: 15°)
-            
-        Returns:
-            Tuple of (gravity_constrained_extrinsic_matrix, intrinsic_matrix)
-        """
-        # Get original pose
-        extrinsic, intrinsic = self.extract_or_get_cached_pose(image_path)
-        
-        # Apply gravity prior
-        gravity_extrinsic = self.apply_gravity_prior(extrinsic, forward_pitch_degrees)
-        
-        # Cache the gravity-constrained result
-        self._cached_extrinsic = gravity_extrinsic
-        
-        return gravity_extrinsic, intrinsic
-    
-    def reset_cache(self):
-        """Reset cached camera pose (useful when switching to different camera setup)."""
-        self._cached_extrinsic = None
-        self._cached_intrinsic = None
-        self._cached_source_image = None
-        logging.info("Camera pose cache reset")
-
-
-def load_camera_parameters(file_path: str) -> dict:
-    """
-    Load camera parameters from a saved .npz file.
-    
-    Args:
-        file_path: Path to the .npz file
-        
-    Returns:
-        Dictionary containing camera parameters
-    """
-    data = np.load(file_path)
-    return {key: data[key] for key in data.files}
-
-
-# Convenience function for quick usage
-def extract_camera_pose_from_image(image_path: str, 
-                                  model_name: str = "facebook/VGGT-1B") -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Quick function to extract camera pose from a single image.
-    
-    Args:
-        image_path: Path to the image
-        model_name: VGGT model name
-        
-    Returns:
-        Tuple of (extrinsic_matrix, intrinsic_matrix)
-    """
-    extractor = CameraPoseExtractor(model_name=model_name)
-    return extractor.extract_single_camera_pose(image_path)
 
 
 if __name__ == "__main__":

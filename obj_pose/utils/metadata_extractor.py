@@ -10,7 +10,7 @@ from PIL import Image
 from PIL.ExifTags import TAGS
 import json
 import os
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Any
 from dataclasses import dataclass
 import subprocess
 

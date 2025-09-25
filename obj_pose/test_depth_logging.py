@@ -5,8 +5,6 @@ Test script to demonstrate depth logging functionality.
 
 import numpy as np
 from utils.depth_logger import create_depth_logger
-import tempfile
-import os
 
 def test_depth_logging():
     """Test the depth logging functionality with synthetic data."""

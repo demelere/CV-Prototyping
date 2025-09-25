@@ -18,7 +18,6 @@ class TravelTracker:
         self.electrode_history = deque(maxlen=history_length)
         self.rod_history = deque(maxlen=history_length)
         self.frame_times = deque(maxlen=history_length)
-        self.last_frame_time = None
         
         # Smoothed velocity vectors
         self.electrode_velocity = None
@@ -104,17 +103,9 @@ class TravelTracker:
         """Get the current electrode velocity vector"""
         return self.electrode_velocity
     
-    def get_rod_velocity(self):
-        """Get the current rod velocity vector"""
-        return self.rod_velocity
-    
     def get_electrode_speed(self):
         """Get the current electrode speed in m/s"""
         return self.electrode_speed
-    
-    def get_rod_speed(self):
-        """Get the current rod speed in m/s"""
-        return self.rod_speed
     
     def get_average_speed(self):
         """Get the average speed over the last N frames"""
@@ -143,4 +134,3 @@ class TravelTracker:
         self.electrode_speed = 0.0
         self.rod_speed = 0.0
         self.speed_history.clear()
-        self.last_frame_time = None

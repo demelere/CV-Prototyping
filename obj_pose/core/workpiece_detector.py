@@ -3,7 +3,6 @@ Workpiece detection module.
 Handles surface detection, plane fitting, and coordinate transformation for welding analysis.
 """
 
-import cv2
 import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.linear_model import RANSACRegressor
@@ -479,19 +478,7 @@ class WorkpieceDetector:
         """Get the confidence of workpiece detection"""
         return self.detection_confidence
     
-    def transform_to_workpiece_coordinates(self, point_3d):
-        """Transform a 3D point from camera coordinates to workpiece coordinates"""
-        if self.coordinate_transform_matrix is None:
-            return point_3d
-        
-        # Convert point to homogeneous coordinates
-        point_homogeneous = np.append(point_3d, 1)
-        
-        # Apply transformation
-        transformed_point = np.dot(self.coordinate_transform_matrix, point_homogeneous)
-        
-        return transformed_point[:3]
-    
+
     def estimate_contact_plane_normal(self, electrode_tip_3d, electrode_axis, depth_map, camera_intrinsics, roi_radius_pixels=50):
         """
         Estimate the local plane normal at the anticipated contact region.

@@ -3,9 +3,7 @@ Depth logging utility for debugging depth estimation outputs.
 Provides controlled logging of raw depth map data without overwhelming the logs.
 """
 
-import os
 import numpy as np
-import json
 from datetime import datetime
 from pathlib import Path
 

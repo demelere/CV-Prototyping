@@ -67,25 +67,3 @@ class DepthEstimatorPipeline:
             print(f"❌ Error in depth estimation: {e}")
             return None
     
-    def get_depth_at_point(self, depth_map, x, y):
-        """Get depth value at specific pixel coordinates"""
-        if depth_map is None:
-            return None
-        
-        height, width = depth_map.shape[:2]
-        
-        # Ensure coordinates are within bounds
-        x = max(0, min(x, width - 1))
-        y = max(0, min(y, height - 1))
-        
-        return depth_map[y, x]
-    
-    def create_depth_visualization(self, depth_map, color_map=cv2.COLORMAP_VIRIDIS):
-        """Create colored depth visualization"""
-        if depth_map is None:
-            return None
-        
-        # Apply color map
-        depth_colored = cv2.applyColorMap(depth_map, color_map)
-        
-        return depth_colored
